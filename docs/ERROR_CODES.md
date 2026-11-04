@@ -33,6 +33,10 @@ Codes describe a condition; severity determines whether it is an error, warning 
 | `TNO-403` | Application is still open | Save documents, close the indicated app and retry. |
 | `TNO-404` | Application validation failed | Review the app result and retry the failed download or installation. |
 | `TNO-405` | Application returned no confirmed result | Retry and review Details; success could not be verified. |
+| `TNO-500` | Selected app removal incomplete | Close the app, sign out or reboot if indicated, then retry. Use Windows Settings for manual removal if needed. |
+| `TNO-501` | Selected app data could not be preserved | Unlock or attach the profile and back up app data before retrying. No removal of this app was started. |
+| `TNO-502` | Service could not be disabled | Review dependencies and policy in services.msc. No dependent services are force-stopped. |
+| `TNO-503` | Desktop or taskbar setting incomplete | Check the Windows edition and policy, sign out and back in, then retry or use Windows Settings. |
 | `TNO-900` | Unexpected engine error | Review Details and report the code and message to the project maintainer. |
 | `TNO-901` | Launcher could not start | Check working-directory access, executable integrity and Windows PowerShell availability. |
 | `TNO-902` | Script execution blocked | Use organization-approved script signing or policy settings; central policy is not overridden. |

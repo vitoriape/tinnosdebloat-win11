@@ -8,7 +8,7 @@ $output=Join-Path $PSScriptRoot 'tinnosdebloat-win11.exe'
 $arguments=@('/nologo','/target:winexe','/platform:x64','/optimize+',
     '/reference:System.Windows.Forms.dll','/reference:System.Drawing.dll','/reference:System.Web.Extensions.dll',
     "/win32manifest:$PSScriptRoot\src\app.manifest", "/out:$output")
-foreach ($name in @('Invoke-Provisioning.ps1','Invoke-UserCleanup.ps1','Provisioning.psm1','Check-OfficeActivation.ps1','config.example.json','error-codes.json')) {
+foreach ($name in @('Invoke-Provisioning.ps1','Invoke-UserCleanup.ps1','Provisioning.psm1','Check-OfficeActivation.ps1','config.example.json','error-codes.json','debloat-catalog.json')) {
     $arguments += "/resource:$PSScriptRoot\$name,Payload.$name"
 }
 $arguments += "$PSScriptRoot\src\Program.cs"

@@ -9,7 +9,16 @@ $script:passed=0
 function Assert($Condition,[string]$Message) { if (!$Condition) { throw $Message } }
 function Test([string]$Name,[scriptblock]$Body) { & $Body; $script:passed++; Write-Output "PASS $Name" }
 function Throws([scriptblock]$Body) { $thrown=$false; try { & $Body } catch { $thrown=$true }; Assert $thrown 'Expected failure.' }
-function Reset-Engine { Import-Module $modulePath -Force -DisableNameChecking }
+function Reset-Engine {
+    Import-Module $modulePath -Force -DisableNameChecking
+    # Capture live events in memory so mocks cannot pollute returned objects.
+    & (Get-Module Provisioning) {
+        $script:Events=@()
+        function script:Send-DeploymentEvent($Kind,$Task,$Message,$Issue=$null) {
+            $script:Events += [pscustomobject]@{Kind=$Kind;Task=$Task;Message=$Message;Issue=$Issue}
+        }
+    }
+}
 function Empty-Teams { [pscustomobject]@{Errors=@();Packages=@();Provisioned=@();MachineEntries=@();MachineBinaries=@();MachineStartup=@();MachineShortcuts=@();MachineAddinFiles=@();Profiles=@()} }
 try {
     Reset-Engine
@@ -129,19 +138,23 @@ try {
         try { Assert ((New-DeploymentRestorePoint).Status -eq 'ReusedRecent') 'Recent point not reported.' }
         finally { Reset-Engine }
     }
-    Test 'Restore failure stops deployment before any software changes (mocked)' {
+    Test 'Restore failure skips system changes but allows independent downloads (mocked)' {
         $module=Get-Module Provisioning
         & $module {
-            $script:Report=[pscustomobject]@{Steps=@();RestorePoint=$null}; $script:MutationReached=$false
+            $script:Report=[pscustomobject]@{Steps=@();RestorePoint=$null;Errors=@();Issues=@();Applications=@();AppIssues=@();Notes=@()}; $script:MutationReached=$false; $script:Downloads=0
             function script:Test-Path { return $false }
             function script:Enable-ComputerRestore { throw 'System Restore unavailable.' }
             function script:Remove-TeamsApplications { $script:MutationReached=$true }
+            function script:Invoke-SelectedDebloat {$script:MutationReached=$true}
+            function script:Install-Office {param($Config);if ($Config.AppMode -ne 'Download') {throw 'Installation attempted'};$script:Downloads++;[pscustomobject]@{Status='Downloaded'}}
+            function script:Install-GoogleChrome {param($Directory,[switch]$DownloadOnly);if (!$DownloadOnly) {throw 'Installation attempted'};$script:Downloads++;[pscustomobject]@{Status='Downloaded'}}
+            function script:Install-GoogleDrive {param($Directory,[switch]$DownloadOnly);if (!$DownloadOnly) {throw 'Installation attempted'};$script:Downloads++;[pscustomobject]@{Status='Downloaded'}}
         }
         try {
-            $errorResult=$null
-            try { Invoke-DeploymentSteps $config $null $null $null 'unused' $work } catch { $errorResult=$_ }
-            Assert ($null -ne $errorResult -and $errorResult.Exception.Data['PendingAction']) 'Restore failure not reported as pending.'
+            Invoke-DeploymentSteps $config $null $null $null 'unused' $work
+            Assert ((& $module {$script:Report.Issues[0].Code}) -eq 'TNO-201') 'Restore failure not reported.'
             Assert (!(& $module {$script:MutationReached})) 'Software mutation preceded restore point.'
+            Assert ((& $module {$script:Downloads}) -eq 3) 'Independent downloads did not continue.'
         } finally { Reset-Engine }
     }
     Test 'Organization restore policy is preserved (mocked)' {
@@ -162,6 +175,7 @@ try {
             function script:Remove-TeamsProvisioning {$script:Trace+='provisioning'}
             function script:Set-TeamsPrevention {$script:Trace+='policy'}
             function script:Assert-TeamsRemovalComplete {$script:Trace+='gate'}
+            function script:Invoke-SelectedDebloat {}
             function script:Install-Office {$script:Trace+='office';[pscustomobject]@{Status='Installed'}}
             function script:Install-GoogleChrome {$script:Trace+='chrome';[pscustomobject]@{Status='Installed'}}
             function script:Install-GoogleDrive {$script:Trace+='drive';[pscustomobject]@{Status='Installed'}}
@@ -183,6 +197,7 @@ try {
             function script:Remove-TeamsProvisioning {}
             function script:Set-TeamsPrevention {}
             function script:Assert-TeamsRemovalComplete {}
+            function script:Invoke-SelectedDebloat {}
             function script:Install-Office {$script:Trace+='office';throw 'DNS lookup failed for www.microsoft.com'}
             function script:Install-GoogleChrome {$script:Trace+='chrome';[pscustomobject]@{Status='Installed'}}
             function script:Install-GoogleDrive {$script:Trace+='drive';[pscustomobject]@{Status='Installed'}}
@@ -210,6 +225,7 @@ try {
             function script:Remove-TeamsProvisioning {}
             function script:Set-TeamsPrevention {}
             function script:Assert-TeamsRemovalComplete {throw 'Download-only does not install anything while cleanup is pending.'}
+            function script:Invoke-SelectedDebloat {}
             function script:Install-Office {param($Config);if ($Config.AppMode -ne 'Download') {throw 'Wrong app mode'};[pscustomobject]@{Status='Downloaded'}}
             function script:Install-GoogleChrome {param($Directory,[switch]$DownloadOnly);if (!$DownloadOnly) {throw 'Chrome installation requested'};[pscustomobject]@{Status='Downloaded'}}
             function script:Install-GoogleDrive {param($Directory,[switch]$DownloadOnly);if (!$DownloadOnly) {throw 'Drive installation requested'};[pscustomobject]@{Status='Downloaded'}}
@@ -256,6 +272,7 @@ try {
             function script:Get-TrustedDownload {param($Url);$script:OdtUrl=$Url;return 'odt-archive.exe'}
             function script:Invoke-Installer {return 0}
             function script:Assert-Publisher {}
+            function script:Assert-OdtExecutable {}
             function script:Get-Item {[pscustomobject]@{VersionInfo=[pscustomobject]@{OriginalFilename='setup.exe';FileDescription='Microsoft Office';ProductName='Office'}}}
         }
         try {
@@ -336,12 +353,169 @@ try {
             Assert ($files.Count -eq 1 -and $files[0].Name -eq 'office-configuration.xml') 'Unexpected saved report or log.'
         } finally {Reset-Engine}
     }
+    Test 'Removal configuration validates IDs and requires explicit selection of high impact services' {
+        Assert ('DarkMode' -in $config.RemoveItems -and 'DesktopIcons' -in $config.RemoveItems -and 'TaskbarSearch' -in $config.RemoveItems -and 'TaskbarWidgets' -in $config.RemoveItems) 'Desktop defaults missing.'
+        foreach($id in @('BitLockerService','RemoteDesktop','Biometrics','SmartCard','ServerService')) {Assert ($id -notin $config.RemoveItems) ('High impact default: '+$id)}
+        $path=Join-Path $work 'choices.json'
+        '{"RemoveItems":["Paint"]}' | Set-Content -LiteralPath $path
+        $selected=Read-DeploymentConfig $path
+        Assert ($selected.RemoveItems.Count -eq 2 -and 'Teams' -in $selected.RemoveItems -and 'Paint' -in $selected.RemoveItems) 'Selections not respected.'
+        '{"RemoveItems":["Defender"]}' | Set-Content -LiteralPath $path
+        Throws {Read-DeploymentConfig $path}
+    }
+    Test 'ODT validation accepts PE files without version-resource assumptions and rejects truncated content' {
+        # Signature/provenance is checked separately by Get-OdtSetup before this parser.
+        $path=Join-Path $work 'setup.exe'
+        $bytes=New-Object byte[] 128; $bytes[0]=0x4d; $bytes[1]=0x5a; $bytes[0x3c]=64; $bytes[64]=0x50; $bytes[65]=0x45
+        [IO.File]::WriteAllBytes($path,$bytes)
+        Assert-OdtExecutable $path
+        [IO.File]::WriteAllText($path,'not a PE')
+        try {Assert-OdtExecutable $path;throw 'Invalid PE accepted'} catch {Assert ((Get-TinnosErrorCode $_) -eq 'TNO-307') 'Wrong invalid ODT code.'}
+    }
+    Test 'Pending Teams blocks Office installation while selected cleanup, Chrome and Drive continue (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Report=[pscustomobject]@{Steps=@();RestorePoint=$null;Applications=@();AppIssues=@();Issues=@();Errors=@();Notes=@()};$script:Trace=@()
+            function script:New-DeploymentRestorePoint {[pscustomobject]@{Status='Created'}}
+            function script:Remove-TeamsApplications {throw (New-TinnosError 'TNO-204' 'Teams data locked')}
+            function script:Remove-TeamsProvisioning {throw 'Provisioning must not run without preservation'}
+            function script:Set-TeamsPrevention {}
+            function script:Assert-TeamsRemovalComplete {throw (New-TinnosError 'TNO-203' 'Teams remains')}
+            function script:Invoke-SelectedDebloat {$script:Trace+='debloat'}
+            function script:Install-Office {throw 'Office must be blocked'}
+            function script:Install-GoogleChrome {$script:Trace+='chrome';[pscustomobject]@{Status='Installed'}}
+            function script:Install-GoogleDrive {$script:Trace+='drive';[pscustomobject]@{Status='Installed'}}
+            function script:Get-GoogleApps {[pscustomobject]@{Chrome=@('chrome.exe')}}
+            function script:Set-ChromeDefault {}
+        }
+        try {
+            $cfg=$config.PSObject.Copy();$cfg.AppMode='Install'
+            Invoke-DeploymentSteps $cfg $null $null $null 'unused' $work
+            Assert ((& $module {$script:Trace -join ','}) -eq 'debloat,chrome,drive') 'An independent task was stopped.'
+            Assert ((& $module {$script:Report.Applications[0].ErrorCode}) -eq 'TNO-203') 'Office gate not reported.'
+            Assert (@(& $module {$script:Events | Where-Object {$_.Kind -eq 'Issue'}}).Count -ge 2) 'Errors not emitted live.'
+        } finally {Reset-Engine}
+    }
+    Test 'Selected app removal is exact, preserves data first and verifies installed and provisioned absence (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Trace=@();$script:AppRemoved=$false;$script:ProvisionRemoved=$false
+            $script:Report=[pscustomobject]@{RebootRequired=$false;Issues=@()}
+            function script:Get-AppxPackage {
+                if (!$script:AppRemoved) {[pscustomobject]@{Name='Microsoft.Paint';PackageFullName='paint-fixture';PackageFamilyName='Microsoft.Paint_fixture';IsFramework=$false;NonRemovable=$false}}
+                [pscustomobject]@{Name='Unrelated.Paint';PackageFullName='unrelated';PackageFamilyName='Unrelated.Paint_fixture';IsFramework=$false;NonRemovable=$false}
+            }
+            function script:Get-AppxProvisionedPackage {if (!$script:ProvisionRemoved) {[pscustomobject]@{DisplayName='Microsoft.Paint';PackageName='paint-provisioning'}}}
+            function script:Backup-SelectedAppData {$script:Trace+='backup'}
+            function script:Remove-AppxPackage {param($Package,[switch]$AllUsers);if ($Package -ne 'paint-fixture' -or !$AllUsers) {throw 'Unsafe removal'};$script:Trace+='app';$script:AppRemoved=$true}
+            function script:Remove-AppxProvisionedPackage {param([switch]$Online,$PackageName,[switch]$AllUsers);if ($PackageName -ne 'paint-provisioning' -or !$AllUsers) {throw 'Unsafe provisioning removal'};$script:Trace+='provision';$script:ProvisionRemoved=$true;[pscustomobject]@{RestartNeeded=$false}}
+        }
+        try {
+            $result=Remove-SelectedApp 'Microsoft.Paint' $work
+            Assert ($result.Status -eq 'Removed' -and (& $module {$script:Trace -join ','}) -eq 'backup,app,provision') 'Removal order or verification wrong.'
+            Throws {Remove-SelectedApp 'Microsoft.Office' $work}
+        } finally {Reset-Engine}
+    }
+    Test 'Locked app data prevents both installed and provisioned removal (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Removed=$false
+            function script:Get-AppxPackage {[pscustomobject]@{Name='Microsoft.Paint';PackageFullName='fixture';PackageFamilyName='fixture';IsFramework=$false;NonRemovable=$false}}
+            function script:Get-AppxProvisionedPackage {[pscustomobject]@{DisplayName='Microsoft.Paint';PackageName='fixture'}}
+            function script:Backup-SelectedAppData {throw (New-TinnosError 'TNO-501' 'Data locked')}
+            function script:Remove-AppxPackage {$script:Removed=$true}
+            function script:Remove-AppxProvisionedPackage {$script:Removed=$true}
+        }
+        try {Throws {Remove-SelectedApp 'Microsoft.Paint' $work};Assert (!(& $module {$script:Removed})) 'Data protection bypassed.'} finally {Reset-Engine}
+    }
+    Test 'An app removal failure still runs subsequent app and service selections (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Trace=@();$script:Report=[pscustomobject]@{Applications=@();AppIssues=@();Issues=@()}
+            function script:Remove-SelectedApp {param($PackageName);$script:Trace+=$PackageName;if ($PackageName -eq 'Clipchamp.Clipchamp') {throw 'App busy'};[pscustomobject]@{Status='Removed'}}
+            function script:Disable-SelectedService {param($Name);$script:Trace+=$Name;[pscustomobject]@{Status='Disabled'}}
+        }
+        try {
+            $cfg=$config.PSObject.Copy();$cfg.RemoveItems=@('Clipchamp','Copilot','SearchIndexing')
+            Invoke-SelectedDebloat $cfg $work
+            Assert ((& $module {$script:Trace -join ','}) -eq 'Clipchamp.Clipchamp,Microsoft.Copilot,Microsoft.CopilotDev,WSearch') 'Failure stopped selected cleanup.'
+            Assert ((& $module {$script:Report.Applications[-1].Status}) -eq 'Disabled') 'Last operation did not complete.'
+        } finally {Reset-Engine}
+    }
+    Test 'Service changes verify disabled state and never force-stop dependent services (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Changed=$false;$script:Stopped=$false
+            function script:Assert-ServicePolicy {}
+            function script:Get-Service {[pscustomobject]@{Status='Running'}}
+            function script:Get-CimInstance {[pscustomobject]@{StartMode=$(if ($script:Changed) {'Disabled'} else {'Auto'});State=$(if ($script:Stopped) {'Stopped'} else {'Running'})}}
+            function script:Stop-Service {param($Name,[switch]$Force);if ($Force) {throw 'Dependent services force stopped'};$script:Stopped=$true}
+            function script:Set-Service {param($Name,$StartupType);if ($StartupType -ne 'Disabled') {throw 'Wrong startup'};$script:Changed=$true}
+        }
+        try {Assert ((Disable-SelectedService WSearch).Status -eq 'Disabled') 'Service state was not verified.';Throws {Disable-SelectedService WinDefend}} finally {Reset-Engine}
+    }
+    Test 'Managed service and desktop policy blocks local changes (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Changed=$false
+            function script:Get-Service {[pscustomobject]@{Status='Running'}}
+            function script:Get-CimInstance {param($ClassName);if ($ClassName -eq 'Win32_ComputerSystem') {[pscustomobject]@{PartOfDomain=$true}} else {throw 'Policy unavailable'}}
+            function script:Stop-Service {$script:Changed=$true}
+            function script:Set-Service {$script:Changed=$true}
+            function script:Set-VerifiedDword {$script:Changed=$true}
+        }
+        try {Throws {Disable-SelectedService WSearch};Throws {Set-SelectedDesktopSetting DarkMode};Assert (!(& $module {$script:Changed})) 'Managed configuration overwritten.'} finally {Reset-Engine}
+    }
+    Test 'Desktop and taskbar policies use the documented values without deleting files (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Writes=@()
+            function script:Assert-LocalDesktopSettings {}
+            function script:Get-ItemProperty {[pscustomobject]@{EditionID='Professional';CurrentBuildNumber='26100'}}
+            function script:Set-VerifiedDword {param($Path,$Name,$Value,[switch]$Policy);$script:Writes+=($Name+'='+$Value);if (!$Policy) {throw 'Expected policy'}}
+            function script:Remove-Item {throw 'Desktop files must not be deleted'}
+        }
+        try {
+            foreach($setting in @('DesktopIcons','TaskbarSearch','TaskbarWidgets')) {Assert ((Set-SelectedDesktopSetting $setting).Status -eq 'Configured') 'Setting failed.'}
+            Assert ((& $module {$script:Writes -join ','}) -eq 'NoDesktop=1,SearchOnTaskbarMode=0,AllowNewsAndInterests=0') 'Wrong shell policy values.'
+        } finally {Reset-Engine}
+    }
+    Test 'Dark mode sets Windows and apps for other profiles even if one hive is inaccessible (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Writes=@();$script:Report=[pscustomobject]@{Issues=@()}
+            function script:Assert-LocalDesktopSettings {}
+            function script:Get-ItemProperty {[pscustomobject]@{EditionID='Professional'}}
+            function script:Get-CimInstance {[pscustomobject]@{SID='locked';Special=$false};[pscustomobject]@{SID='available';Special=$false}}
+            function script:Use-ProfileHive {param($Profile,$Action);if ($Profile.SID -eq 'locked') {throw 'Hive locked'};& $Action 'Registry::HKEY_USERS\available'}
+            function script:Set-VerifiedDword {param($Path,$Name,$Value);$script:Writes+=($Name+'='+$Value)}
+        }
+        try {
+            Throws {Set-SelectedDesktopSetting DarkMode}
+            Assert ((& $module {$script:Writes -join ','}) -eq 'AppsUseLightTheme=0,SystemUsesLightTheme=0') 'Available profile did not get dark mode.'
+            Assert ((& $module {$script:Report.Issues[0].Code}) -eq 'TNO-503') 'Inaccessible profile not reported.'
+        } finally {Reset-Engine}
+    }
+    Test 'Drive installer excludes Docs editors and desktop shortcuts, and verifies Drive before success (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Args='';$script:Calls=0
+            function script:Get-GoogleApps {$script:Calls++;[pscustomobject]@{Drive=$(if ($script:Calls -ge 2) {@('GoogleDriveFS.exe')} else {@()})}}
+            function script:Get-TrustedDownload {return 'drive-fixture.exe'}
+            function script:Invoke-Installer {param($FilePath,$Arguments);$script:Args=$Arguments;return 0}
+        }
+        try {
+            Assert ((Install-GoogleDrive $work).Status -eq 'Installed') 'Drive not verified.'
+            $arguments=& $module {$script:Args}
+            Assert ($arguments.Contains('--gsuite_shortcuts=false') -and !$arguments.Contains('--desktop_shortcut')) 'Unwanted Google shortcuts requested.'
+        } finally {Reset-Engine}
+    }
     $exe=Join-Path $root 'tinnosdebloat-win11.exe'
     $assembly=[Reflection.Assembly]::LoadFile($exe)
     $type=$assembly.GetType('TinnosDebloat.Payload',$true)
     Test 'Portable EXE embeds all current PowerShell sources and defaults' {
         $null=$type.GetMethod('Validate').Invoke($null,@())
-        foreach ($file in @('Invoke-Provisioning.ps1','Invoke-UserCleanup.ps1','Provisioning.psm1','Check-OfficeActivation.ps1','config.example.json','error-codes.json')) {
+        foreach ($file in @('Invoke-Provisioning.ps1','Invoke-UserCleanup.ps1','Provisioning.psm1','Check-OfficeActivation.ps1','config.example.json','error-codes.json','debloat-catalog.json')) {
             $stream=$assembly.GetManifestResourceStream("Payload.$file"); $memory=New-Object IO.MemoryStream
             try {
                 $stream.CopyTo($memory)
@@ -400,6 +574,18 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
         } finally {$process.Dispose()}
         Assert ($config.Languages.Count -eq 1 -and $config.Languages[0] -eq 'pt-br') 'Diagnostic culture changed Office language.'
     }
+    Test 'Installer waiting emits live elapsed-time heartbeats and accepted exit status using a harmless process' {
+        $module=Get-Module Provisioning
+        & $module {$script:Report=[pscustomobject]@{Operations=@();RebootRequired=$false}}
+        $fixture=Join-Path $work 'harmless-wait.ps1'
+        'Start-Sleep -Seconds 6; exit 0' | Set-Content -LiteralPath $fixture
+        $result=Invoke-Installer "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$fixture`"" @(0)
+        Assert ($result -eq 0) 'Harmless process exit not captured.'
+        $events=@(& $module {$script:Events})
+        Assert (@($events | Where-Object {$_.Kind -eq 'Progress' -and $_.Message -match 'Elapsed:.*Remaining time: unavailable'}).Count -ge 1) 'No heartbeat during wait.'
+        Assert ($events[-1].Kind -eq 'Success') 'Accepted process exit not confirmed.'
+        Reset-Engine
+    }
     Test 'Interface has only Start and Details actions with fixed Office language' {
         Add-Type -AssemblyName System.Windows.Forms
         $form=$assembly.GetType('TinnosDebloat.Ui').GetMethod('Create').Invoke($null,@())
@@ -407,7 +593,13 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
         try {
             $controls=@(Walk-Controls $form)
             Assert ($form.Text -eq 'TinnosDebloat-Win11') 'Unexpected product name.'
-            Assert (@($controls | Where-Object {$_ -is [Windows.Forms.CheckBox]}).Count -eq 3) 'Unexpected Office selection count.'
+            Assert (@($controls | Where-Object {$_ -is [Windows.Forms.CheckBox]}).Count -eq 4) 'Unexpected selection count.'
+            $choices=$form.Controls.Find('removalList',$true)[0]
+            Assert ($choices.Items.Count -eq (Get-Content (Join-Path $root 'debloat-catalog.json') -Raw | ConvertFrom-Json).Count) 'Removal choices differ from the engine catalog.'
+            Assert ($choices.CheckedItems.Count -lt $choices.Items.Count) 'High impact services must require selection.'
+            $choices.SetItemChecked(0,$false)
+            Assert ($choices.GetItemChecked(0)) 'Mandatory Teams removal was disabled.'
+            Assert ($form.Controls.Find('detailTabs',$true)[0].TabPages.Count -eq 2) 'Results tab remains.'
             $actions=@($controls | Where-Object {$_ -is [Windows.Forms.Button]})
             Assert ($actions.Count -eq 2 -and 'Start' -in $actions.Text -and 'Details' -in $actions.Text) 'Unexpected action buttons.'
             Assert (!@($controls | Where-Object {($_ -is [Windows.Forms.CheckBox] -or $_ -is [Windows.Forms.Button]) -and $_.Text -match 'PT-BR|English|Audit|reports'}).Count) 'Removed control still exists.'
@@ -429,13 +621,28 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
             $wire='TINNOS_RESULT:'+([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)))
             $decoded=[TinnosDebloat.ResultChannel]::Decode($wire)
             $form.ApplyResult($decoded)
-            $rows=$form.Controls.Find('resultList',$true)[0].Items
-            Assert ($rows.Count -eq 4) 'Result rows missing.'
-            Assert (@($rows | Where-Object {$_.Text -eq 'Office activation'})[0].SubItems[1].Text -eq 'Deferred') 'Deferred activation missing.'
+            $activity=$form.Controls.Find('liveLog',$true)[0].Text
+            Assert ($activity.Contains('Chrome: Failed') -and $activity.Contains('Office activation: Deferred')) 'Final summary missing.'
             $errors=$form.Controls.Find('errorDetails',$true)[0].Text
             Assert ($errors.Contains('TNO-400') -and $errors.Contains('1603') -and $errors.Contains('Check vendor exit')) 'Error evidence or recovery action missing.'
             Throws {$null=[TinnosDebloat.ResultChannel]::Decode('TINNOS_RESULT:invalid!')}
             Throws {$form.ApplyResult('{}')}
+        } finally {$form.Dispose()}
+    }
+    Test 'Live errors and success updates appear before completion and final errors are deduplicated' {
+        $form=[TinnosDebloat.Ui]::Create()
+        try {
+            $issue=@{Code='TNO-500';Title='Removal incomplete';Message='App is busy';Stage='Paint';Severity='Error';Action='Close Paint and retry';NativeCode=5}
+            $event=@{Kind='Issue';Task='Paint';Message='App is busy';Issue=$issue}|ConvertTo-Json -Depth 6 -Compress
+            $form.ApplyEvent($event)
+            Assert ($form.Controls.Find('errorDetails',$true)[0].Text.Contains('Close Paint and retry')) 'Live error missing before final report.'
+            $form.ApplyEvent('{"Kind":"Progress","Task":"Google Drive","Message":"Elapsed: 00:05. Remaining time: unavailable."}')
+            Assert ($form.Controls.Find('currentTask',$true)[0].Text.Contains('Google Drive')) 'Status is stale.'
+            $form.ApplyEvent('{"Kind":"Success","Task":"Chrome","Message":"Installed"}')
+            Assert ($form.Controls.Find('liveLog',$true)[0].Text.Contains('OK - Chrome: Installed')) 'Success message missing.'
+            $form.ApplyResult((@{Status='CompletedWithIssues';Issues=@($issue)}|ConvertTo-Json -Depth 6 -Compress))
+            $text=$form.Controls.Find('errorDetails',$true)[0].Text
+            Assert ([regex]::Matches($text,'\[TNO-500\]').Count -eq 1) 'Live error duplicated or lost on completion.'
         } finally {$form.Dispose()}
     }
     Test 'EXE checksum sidecar matches the build' {

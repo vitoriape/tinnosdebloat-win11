@@ -4,7 +4,7 @@ Windows 11 cleanup and workstation provisioning, with a restore point before dep
 
 <div align="center">
 
-![version](https://img.shields.io/badge/version-2.2.0-dab467.svg)
+![version](https://img.shields.io/badge/version-2.3.0-dab467.svg)
 ![status](https://img.shields.io/badge/status-preview-64748b.svg)
 ![platform](https://img.shields.io/badge/Windows_11-x64-0078D4.svg)
 ![launcher](https://img.shields.io/badge/C%23-WinForms-512BD4.svg)
@@ -25,6 +25,7 @@ Windows 11 cleanup and workstation provisioning, with a restore point before dep
 - [📁 Repository Structure](#-repository-structure)
 - [🔎 Results](#-results)
 - [Error codes](docs/ERROR_CODES.md)
+- [Removal and service checklist](docs/DEBLOAT.md)
 - [🔧 Build and Test](#-build-and-test)
 - [🚧 Versions](#-versions)
 - [🔗 References](#-references)
@@ -49,9 +50,10 @@ those green flying enemies in Tinnos: the **Tinnos Wasps**. The stage's giant wa
 are described in [Stella's Tinnos walkthrough](https://tombraiders.net/stella/walks/TR3walk/A3-tinnos.html).
 This is an independent utility with no affiliation with the game or its publishers.
 
-The current cleanup scope is Teams and its installation paths. This tool does
-not remove an arbitrary list of Windows apps, disable Windows Update or Defender,
-or erase personal documents.
+Cleanup includes Teams, a selectable list of built-in apps and specific services,
+plus desktop/taskbar preferences and dark mode. The exact scope is documented in
+the [removal and service checklist](docs/DEBLOAT.md). Windows Update, Defender,
+shared frameworks and personal documents are preserved.
 
 ![TinnosDebloat-Win11 interface](docs/interface.png)
 
@@ -62,9 +64,12 @@ or erase personal documents.
 | Access | Optional selection |
 | Teams | Always excluded; new, classic, personal, machine-wide and provisioned variants checked |
 | OneDrive | Excluded from Office when selected; existing standalone OneDrive and its documents are preserved |
-| New Outlook | Excluded from Office when selected; classic Outlook remains required |
+| New Outlook | Removed when selected in the checklist and excluded from Office; classic Outlook remains required |
 | Chrome | Official Google Enterprise MSI; browser associations configured only in Install mode |
-| Google Drive for desktop | Official Google installer; downloaded by default, silent installation optional |
+| Google Drive for desktop | Official installer; no Docs/Sheets/Slides shortcuts or requested desktop shortcut |
+| Built-in apps and services | Expandable removal checklist; exact packages/services, independent steps and final checks |
+| Desktop and taskbar | Hide desktop icons without deleting files; hide search and Widgets news/weather |
+| Dark mode | Windows and app theme preferences for existing local user profiles |
 
 ## 💡 Technologies
 
@@ -112,10 +117,21 @@ channel in JSON for command-line deployment.
 
 Leave **Download only** selected to save the files, or choose **Download + install**
 to attempt silent app installation. These modes are mutually exclusive. **Start**
-runs the selected action. **Details** expands the Results, Errors and Log tabs.
+runs the selected action. **Details** expands the **Log** and **Errors** tabs.
 Teams cleanup and restore-point handling still run with either action;
 Download only applies to Office, Chrome and Drive, not to cleanup.
 An app download/install error never cancels attempts for the remaining apps.
+
+Expand **Choose apps, services and desktop settings** to review the removal
+checklist before Start. Teams removal remains required. The supplied config selects
+the listed built-in apps, search indexing, Xbox background services, desktop/taskbar
+settings and dark mode. Higher impact services such as BitLocker management,
+biometrics, Smart Card, Server/SMB and Remote Desktop start unchecked.
+Read their effects in [the checklist reference](docs/DEBLOAT.md) before selecting.
+Selections are saved in the run's working configuration as `RemoveItems` IDs;
+the supplied `config.example.json` shows the same defaults as the interface.
+
+![Live task details (illustrative events, no installation)](docs/interface-details.png)
 
 ### Official downloads
 
@@ -140,6 +156,16 @@ Google's official `dl.google.com` endpoints and must pass Google signature check
 ODT downloads Office files before installation. No tools are taken from third-party
 script collections or unofficial mirrors.
 
+The ODT archive and its extracted `setup.exe` must both pass Microsoft signature
+checks. Executable validation no longer relies on version-resource descriptions
+or `OriginalFilename`, which vary between releases and caused false `TNO-307`
+failures. Office still runs through ODT `/download` and `/configure`.
+
+Drive uses Google's documented `--gsuite_shortcuts=false` option and omits
+`--desktop_shortcut`. These options prevent creation of extra shortcuts on this
+installation; they do not uninstall the Docs/Sheets/Slides web services or delete
+shortcuts left by earlier installations. Hiding desktop icons leaves those files intact.
+
 ---
 
 ## 🚀 Usage
@@ -150,7 +176,7 @@ script collections or unofficial mirrors.
 2. Open it and approve the Windows administrator request.
 3. Choose the app action and optional Office components. Office language is always PT-BR.
 4. Select **Start** to run cleanup and the chosen download/install action.
-5. Select **Details** to view results, error codes and the live log inside the application.
+5. Select **Details** for the live Log and Errors tabs. The status line follows the current task.
 
 Opening the app does not deploy anything. Closing is blocked while an operation
 is running, so installers are not interrupted by closing the window.
@@ -217,14 +243,19 @@ Windows normally limits `Checkpoint-Computer` to one point per day. If Windows
 explicitly throttles creation, a verified point less than 24 hours old can be
 used, recording `ReusedRecent`, its sequence and timestamp. That older point does
 not represent the exact state immediately before this run. A fresh point is
-reported as `Created`. If neither is available, deployment stops before removing
-or installing applications and reports the pending action.
+reported as `Created`. If neither is available, system changes are skipped and the
+error appears immediately. Independent app downloads can continue, including when
+Download + install was selected; no application installation or debloat mutation
+is attempted without the restore-point prerequisite.
 
 Restore points are not backups of personal documents. Before Teams uninstall,
 known local Teams data stores are separately copied to an administrator/SYSTEM-only
 `PreservedTeamsData` directory. Locked data, unreadable profiles, running Teams and
 redirected data stores block removal. No recursive deletion of Microsoft folders,
 synchronized files, Desktop documents or Downloads is performed.
+Selected Store apps likewise require a protected `PreservedAppData` copy before
+uninstallation. Unreadable or redirected app data blocks that app's removal while
+other selections continue. Detached profile containers must be attached to be covered.
 
 ## ⚙️ Architecture
 
@@ -241,12 +272,12 @@ flowchart TD
     I --> Q{App mode}
     Q -->|Download| L[Download apps / optionally install]
     Q -->|Install| J{Teams fully removed?}
-    J -->|Pending| K[Report sign-in / retry / reboot action]
+    J -->|Pending| K[Skip Office install; continue independent tasks]
     J -->|Yes| L
     L --> M[Record each app; continue after app errors]
     M --> N[Configure browser associations in Install mode]
     N --> O[Validate app results, profiles and policies]
-    O --> P[Results and coded errors inside the application]
+    O --> P[Live Log and Errors inside the application]
 ```
 
 Matching Office installations are skipped. Product, bitness, apps, languages,
@@ -256,9 +287,9 @@ applications are not force-closed.
 
 Matching-install checks apply only to Install mode. Download mode can prepare
 Office media regardless of the installed Office edition. Pending Teams cleanup
-blocks application installation; downloading the app files can continue without
-claiming Teams is absent. Restore-point and centrally managed policy blockers
-remain enforced.
+blocks Office installation; Chrome, Drive and independent cleanup selections can
+continue. Downloading never proves Teams is absent. Restore-point and central
+policy prerequisites remain enforced for the affected operations.
 
 Classic Teams profiles use limited interactive tasks named
 `TinnosDebloat-Win11-RemoveTeams-<SID>`, without saved credentials. Offline profiles
@@ -285,6 +316,7 @@ tinnosdebloat-win11/
 ├── Provisioning.psm1
 ├── config.example.json
 ├── error-codes.json             # Shared error catalog
+├── debloat-catalog.json         # Exact removals, services and preferences
 ├── src/
 │   ├── Program.cs
 │   └── app.manifest
@@ -292,6 +324,8 @@ tinnosdebloat-win11/
 │   └── Run-Tests.ps1
 ├── docs/
 │   ├── interface.png
+│   ├── interface-details.png
+│   ├── DEBLOAT.md
 │   └── ERROR_CODES.md
 └── README.md
 ```
@@ -303,9 +337,19 @@ repository for review and rebuilding.
 
 **Details** displays the current run inside the application:
 
-- **Results:** restore point, individual applications, cleanup and policy checks.
-- **Errors:** stable `TNO-xxx` codes, the original message, recovery action and native exit code when available.
-- **Log:** live execution output and additional notes.
+- **Log:** live tasks, elapsed installer time, explicit success messages and a final verification summary.
+- **Errors:** errors, warnings and pending actions appear as they happen, with `TNO-xxx` codes, recovery actions and native exit codes when available.
+
+The separate Results tab was removed. The status beneath Details follows the
+same live events as the Log. An error is retained in both tabs, with duplicate
+final error entries suppressed. Each independent task is attempted even after an
+earlier failure; dependent or unsafe operations are skipped with a reason.
+
+Installers emit a heartbeat about every five seconds while their process is
+running. Drive is checked again after its installer exits before reporting success.
+These silent installers do not expose a reliable remaining-time estimate or their
+internal task list. The tool shows the current operation and actual elapsed time,
+with **Remaining time: unavailable**, instead of an invented percentage or countdown.
 
 Results and the live log stay in memory and are lost when the application closes.
 Application diagnostics and PowerShell use English (`en-US`), independently of
@@ -321,7 +365,7 @@ a vendor installer/uninstaller failure; the native exit code gives further detai
 Downloaded installers, Office media/XML, extracted scripts, configuration and
 pending cleanup-task dependencies still need working files under
 `C:\ProgramData\TinnosDebloat-Win11\Runs\<run-id>\Work` and its parent run directory.
-Protected `PreservedTeamsData` is retained when user data needs preservation.
+Protected `PreservedTeamsData` and `PreservedAppData` are retained when user data needs preservation.
 Windows and vendor tools may create their own system logs. Reports left by older
 versions are not automatically deleted.
 
@@ -337,8 +381,9 @@ Teams components, individual app outcomes and deferred activation. Inaccessible
 relevant inventory prevents a claim of complete removal. Complete provisioning
 does not imply that the employee's Office account is activated.
 
-The Applications summary distinguishes `Downloaded`, `Installed`, `AlreadyInstalled`
-and `Failed`. Required cleanup checks are separated from app observations.
+The final Log summary distinguishes `Downloaded`, `Installed`, `AlreadyInstalled`,
+`Removed`, `Disabled`, `Configured`, `NotPresent` and `Failed`.
+Required cleanup checks are separated from app observations.
 Downloading an installer never reports its app as installed. Failed optional apps
 produce `CompletedWithIssues` only when the required cleanup checks pass; remaining
 Teams, unreadable profiles or policy conflicts cannot be hidden by skipping apps.
@@ -363,6 +408,20 @@ mocks. They do not install software, change execution policies or create restore
 points. The preview is rendered from the real form without starting deployment.
 
 ## 🚧 Versions
+
+<details>
+<summary><strong>[See/Hide] Version 2.3.0 — Selectable cleanup and live activity</strong></summary>
+
+- Fixed false ODT setup validation failures while retaining signed official tools.
+- Expandable app/service checklist, protected app-data copies and all-user/provisioning verification.
+- Services from the requested Services console list, with higher impact choices unchecked by default.
+- Dark mode, hidden desktop icons, and hidden taskbar search/news/weather options.
+- Drive-only shortcut configuration and verified installation outcomes.
+- Live status, immediate errors, explicit success messages and elapsed installer time.
+- Log and Errors replace the separate Results screen; independent tasks continue after failures.
+- Updated error codes, tests, executable and interface previews.
+
+</details>
 
 <details>
 <summary><strong>[See/Hide] Version 2.2.0 — Results inside the app</strong></summary>
@@ -411,6 +470,10 @@ points. The preview is rendered from the real form without starting deployment.
 - [Microsoft 365 activation diagnostics](https://learn.microsoft.com/en-us/microsoft-365-apps/licensing-activation/vnextdiag)
 - [Google Drive deployment](https://knowledge.workspace.google.com/admin/drive/set-up-drive-for-desktop-for-your-organization)
 - [Windows default associations](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-applicationdefaults)
+- [All-user Appx removal](https://learn.microsoft.com/en-us/powershell/module/appx/remove-appxpackage?view=windows-11)
+- [Hide desktop items policy](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-desktop#nodesktop)
+- [Taskbar search policy](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-search)
+- [Widgets news/weather policy](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-newsandinterests)
 
 ---
 

@@ -14,13 +14,13 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("TinnosDebloat-Win11")]
 [assembly: AssemblyDescription("Windows 11 provisioning and Teams removal")]
-[assembly: AssemblyVersion("2.2.0.0")]
+[assembly: AssemblyVersion("2.3.0.0")]
 
 namespace TinnosDebloat
 {
     public static class Payload
     {
-        public static readonly string[] Files = { "Invoke-Provisioning.ps1", "Invoke-UserCleanup.ps1", "Provisioning.psm1", "Check-OfficeActivation.ps1", "config.example.json", "error-codes.json" };
+        public static readonly string[] Files = { "Invoke-Provisioning.ps1", "Invoke-UserCleanup.ps1", "Provisioning.psm1", "Check-OfficeActivation.ps1", "config.example.json", "error-codes.json", "debloat-catalog.json" };
         public static void Validate()
         {
             foreach (string file in Files)
@@ -163,38 +163,59 @@ namespace TinnosDebloat
         private readonly CheckBox outlook = Toggle("Exclude new Outlook", true);
         private readonly Button start = ActionButton("Start");
         private readonly Button details = ActionButton("Details");
-        private readonly TextBox log = new TextBox { Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Both,
+        private readonly TextBox log = new TextBox { Name = "liveLog", Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Both,
             WordWrap = false, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
         private readonly TextBox errors = new TextBox { Name = "errorDetails", Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical,
             WordWrap = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
-        private readonly ListView results = new ListView { Name = "resultList", Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true,
-            BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None, ShowItemToolTips = true };
+        private readonly CheckedListBox cleanup = new CheckedListBox { Name = "removalList", Dock = DockStyle.Fill, Height = 190,
+            CheckOnClick = true, Visible = false, HorizontalScrollbar = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
+        private readonly CheckBox showCleanup = new CheckBox { Name = "cleanupToggle", Text = "Choose apps, services and desktop settings", AutoSize = true, ForeColor = Color.Gainsboro };
+        private readonly List<CleanupItem> cleanupItems = new List<CleanupItem>();
+        private readonly HashSet<string> displayedIssues = new HashSet<string>();
         private readonly TabControl detailTabs = new TabControl { Name = "detailTabs", Dock = DockStyle.Fill, Visible = false };
-        private readonly Label status = new Label { Text = "Ready — Office PT-BR", AutoSize = true, ForeColor = Color.Gainsboro, Margin = new Padding(0, 10, 0, 8) };
+        private readonly Label status = new Label { Name = "currentTask", Text = "Ready - Office PT-BR", Dock = DockStyle.Fill, Height = 42, ForeColor = Color.Gainsboro, Margin = new Padding(0, 10, 0, 8) };
         private readonly ProgressBar progress = new ProgressBar { Dock = DockStyle.Fill, Height = 4 };
         private Process running;
         private string directory, output;
         private bool receivedResult;
         private string primaryCode = "";
+        private sealed class CleanupItem {
+            public string Id, Label;
+            public override string ToString() { return Label; }
+        }
 
         public MainForm()
         {
             Text = "TinnosDebloat-Win11"; BackColor = Background; ForeColor = Color.White;
-            Font = new Font("Segoe UI", 10); ClientSize = new Size(680, 370); MinimumSize = new Size(696, 409);
+            Font = new Font("Segoe UI", 10); ClientSize = new Size(760, 420); MinimumSize = new Size(776, 459);
             StartPosition = FormStartPosition.CenterScreen;
-            TableLayoutPanel layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(22), ColumnCount = 1, RowCount = 6 };
-            for (int i = 0; i < 4; i++) layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            TableLayoutPanel layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(22), ColumnCount = 1, RowCount = 7 };
+            for (int i = 0; i < 5; i++) layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 5));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             layout.Controls.Add(Section("APP ACTION", Row(downloadOnly, installApps), "Restore point and Teams cleanup are always included."));
             layout.Controls.Add(Section("OFFICE OPTIONS", Row(access, oneDrive, outlook), "Microsoft 365 Apps for Business · PT-BR · 64-bit"));
+            TableLayoutPanel removalPanel = new TableLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, ColumnCount = 1, Margin = new Padding(0, 0, 0, 12) };
+            removalPanel.Controls.Add(showCleanup); removalPanel.Controls.Add(cleanup); layout.Controls.Add(removalPanel);
+            using (Stream data = Assembly.GetExecutingAssembly().GetManifestResourceStream("Payload.debloat-catalog.json"))
+            using (StreamReader reader = new StreamReader(data)) {
+                foreach (object entry in (object[])ResultChannel.Serializer().DeserializeObject(reader.ReadToEnd())) {
+                    Dictionary<string, object> item = (Dictionary<string, object>)entry;
+                    CleanupItem choice = new CleanupItem { Id = TextValue(item, "Id"), Label = TextValue(item, "Name") };
+                    cleanupItems.Add(choice); cleanup.Items.Add(choice, !(Value(item, "DefaultSelected") is bool) || (bool)Value(item, "DefaultSelected"));
+                }
+            }
+            cleanup.ItemCheck += delegate(object sender, ItemCheckEventArgs e) {
+                if (cleanupItems[e.Index].Id == "Teams") e.NewValue = CheckState.Checked;
+                if (cleanupItems[e.Index].Id == "NewOutlook" && e.NewValue == CheckState.Checked) outlook.Checked = true;
+            };
+            showCleanup.CheckedChanged += delegate { cleanup.Visible = showCleanup.Checked; SetDetails(detailTabs.Visible); };
             start.Width = 300; details.Width = 140; details.Name = "detailsButton"; start.Name = "startButton";
             layout.Controls.Add(ActionRow(details, start));
             layout.Controls.Add(status); layout.Controls.Add(progress);
-            results.Columns.Add("Component", 220); results.Columns.Add("Result", 130); results.Columns.Add("Code", 110); results.Columns.Add("Details", 260);
-            foreach (string name in new string[] { "Results", "Errors", "Log" })
+            foreach (string name in new string[] { "Log", "Errors" })
                 detailTabs.TabPages.Add(new TabPage(name) { BackColor = Surface, Padding = new Padding(8) });
-            detailTabs.TabPages[0].Controls.Add(results); detailTabs.TabPages[1].Controls.Add(errors); detailTabs.TabPages[2].Controls.Add(log);
+            detailTabs.TabPages[0].Controls.Add(log); detailTabs.TabPages[1].Controls.Add(errors);
             layout.Controls.Add(detailTabs); Controls.Add(layout);
             start.BackColor = Accent; start.ForeColor = Background;
             details.FlatAppearance.BorderColor = Color.FromArgb(75, 88, 100);
@@ -206,12 +227,8 @@ namespace TinnosDebloat
         }
         private static CheckBox Toggle(string text, bool selected)
         {
-            CheckBox button = new CheckBox { Text = text, Checked = selected, Appearance = Appearance.Button, AutoSize = false,
-                Width = 196, Height = 38,
-                TextAlign = ContentAlignment.MiddleCenter, FlatStyle = FlatStyle.Flat, Padding = Padding.Empty, Margin = new Padding(0, 0, 8, 0) };
-            button.FlatAppearance.BorderColor = Accent;
-            Action recolor = delegate { button.BackColor = button.Checked ? Accent : Surface; button.ForeColor = button.Checked ? Background : Color.Gainsboro; };
-            button.CheckedChanged += delegate { recolor(); }; recolor(); return button;
+            return new CheckBox { Text = text, Checked = selected, AutoSize = true, ForeColor = Color.Gainsboro,
+                Padding = Padding.Empty, Margin = new Padding(0, 0, 16, 0) };
         }
         private static RadioButton ModeButton(string text, bool selected)
         {
@@ -226,7 +243,8 @@ namespace TinnosDebloat
         {
             detailTabs.Visible = show;
             int availableHeight = Screen.FromControl(this).WorkingArea.Height - SystemInformation.CaptionHeight - 32;
-            ClientSize = new Size(ClientSize.Width, show ? Math.Max(370, Math.Min(720, availableHeight)) : 370);
+            int compact = showCleanup.Checked ? 610 : 420;
+            ClientSize = new Size(ClientSize.Width, Math.Min(availableHeight, show ? Math.Max(compact + 180, 780) : compact));
         }
         private static Button ActionButton(string text)
         {
@@ -261,6 +279,11 @@ namespace TinnosDebloat
         {
             if (text == null || IsDisposed) return;
             if (InvokeRequired) { BeginInvoke(new Action<string>(Append), text); return; }
+            if (text.StartsWith("TINNOS_EVENT:", StringComparison.Ordinal)) {
+                try { ApplyEvent(Encoding.UTF8.GetString(Convert.FromBase64String(text.Substring("TINNOS_EVENT:".Length)))); }
+                catch (Exception error) { DisplayError("TNO-904", error.Message); }
+                return;
+            }
             if (text.StartsWith(ResultChannel.Prefix, StringComparison.Ordinal)) {
                 try { ApplyResult(ResultChannel.Decode(text)); }
                 catch (Exception error) { DisplayError("TNO-904", error.Message); }
@@ -270,7 +293,7 @@ namespace TinnosDebloat
         }
         private void Busy(bool busy)
         {
-            foreach (Control item in new Control[] { downloadOnly, installApps, access, oneDrive, outlook, start }) item.Enabled = !busy;
+            foreach (Control item in new Control[] { downloadOnly, installApps, access, oneDrive, outlook, cleanup, start }) item.Enabled = !busy;
             progress.Style = busy ? ProgressBarStyle.Marquee : ProgressBarStyle.Blocks;
         }
         private void Run()
@@ -284,9 +307,12 @@ namespace TinnosDebloat
                     { "IncludeAccess", access.Checked }, { "ExcludeOneDrive", oneDrive.Checked }, { "ExcludeNewOutlook", outlook.Checked },
                     { "AppMode", downloadOnly.Checked ? "Download" : "Install" }
                 };
+                List<string> selected = new List<string>();
+                foreach (CleanupItem item in cleanup.CheckedItems) selected.Add(item.Id);
+                config["RemoveItems"] = selected.ToArray();
                 string configPath = Path.Combine(directory, "config.json");
                 File.WriteAllText(configPath, new JavaScriptSerializer().Serialize(config), new UTF8Encoding(false));
-                receivedResult = false; primaryCode = ""; log.Clear(); errors.Clear(); results.Items.Clear();
+                receivedResult = false; primaryCode = ""; log.Clear(); errors.Clear(); displayedIssues.Clear(); detailTabs.TabPages[1].Text = "Errors";
                 Append("Starting. Results remain in memory. Working files: " + output);
                 running = new Process { StartInfo = Payload.Command(directory, configPath, "Deploy", output), EnableRaisingEvents = true };
                 running.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { Append(e.Data); };
@@ -295,7 +321,7 @@ namespace TinnosDebloat
                 child.Exited += delegate { ThreadPool.QueueUserWorkItem(delegate {
                     child.WaitForExit(); BeginInvoke(new Action(delegate { Finish(child); }));
                 }); };
-                Busy(true); status.Text = "Creating restore point and preparing deployment...";
+                Busy(true); SetDetails(true); detailTabs.SelectedIndex = 0; status.Text = "Starting inventory...";
                 running.Start(); running.BeginOutputReadLine(); running.BeginErrorReadLine();
             }
             catch (Exception error) {
@@ -313,7 +339,7 @@ namespace TinnosDebloat
                     DisplayError(blocked ? "TNO-902" : "TNO-903", "Worker exit code: " + code + ". Review the Log tab.");
                 }
             } else status.Text = (primaryCode == "" ? "" : "[" + primaryCode + "] ") + (code == 0 ? "Complete. View Details."
-                : code == 2 ? "Cleanup passed; some apps were skipped. View Details."
+                : code == 2 ? "Finished with issues. See Errors and retry failed tasks."
                 : code == 3010 ? "Action needed. View Details." : "Check failed. View Details.");
             child.Dispose(); running = null;
             Busy(false); SetDetails(true);
@@ -323,46 +349,66 @@ namespace TinnosDebloat
             primaryCode = code; errors.AppendText(ResultChannel.ErrorText(code, message) + Environment.NewLine + Environment.NewLine);
             status.Text = "[" + code + "] View Details."; SetDetails(true); detailTabs.SelectedIndex = 1;
         }
+        private void ShowIssue(Dictionary<string, object> issue)
+        {
+            string key = TextValue(issue, "Code") + "|" + TextValue(issue, "Stage") + "|" + TextValue(issue, "Message") + "|" + TextValue(issue, "Severity");
+            if (!displayedIssues.Add(key)) return;
+            string code = TextValue(issue, "Code"), severity = TextValue(issue, "Severity");
+            if (primaryCode == "" && severity != "Warning") primaryCode = code;
+            string text = "[" + code + "] " + TextValue(issue, "Title") + " (" + severity + ")" + Environment.NewLine
+                + TextValue(issue, "Stage") + ": " + TextValue(issue, "Message") + Environment.NewLine
+                + "Next step: " + TextValue(issue, "Action") + Environment.NewLine
+                + (Value(issue, "NativeCode") == null ? "" : "Native exit code: " + TextValue(issue, "NativeCode") + Environment.NewLine);
+            errors.AppendText(text + Environment.NewLine);
+            log.AppendText(text + Environment.NewLine);
+            detailTabs.TabPages[1].Text = "Errors (" + displayedIssues.Count + ")";
+        }
+        public void ApplyEvent(string json)
+        {
+            Dictionary<string, object> entry = ResultChannel.Serializer().DeserializeObject(json) as Dictionary<string, object>;
+            if (entry == null || Value(entry, "Kind") == null) throw new InvalidDataException("Invalid live event.");
+            string kind = TextValue(entry, "Kind"), task = TextValue(entry, "Task"), message = TextValue(entry, "Message");
+            status.Text = task + ": " + message;
+            if (kind == "Issue") {
+                Dictionary<string, object> issue = Value(entry, "Issue") as Dictionary<string, object>;
+                if (issue == null) throw new InvalidDataException("Live issue has no error details.");
+                ShowIssue(issue);
+            } else log.AppendText("[" + DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + "] "
+                + (kind == "Success" ? "OK - " : "") + task + ": " + message + Environment.NewLine);
+        }
         private static object Value(Dictionary<string, object> map, string key)
         {
             object value; return map != null && map.TryGetValue(key, out value) ? value : null;
         }
         private static string TextValue(Dictionary<string, object> map, string key) { return Convert.ToString(Value(map, key)); }
         private static object[] Items(Dictionary<string, object> map, string key) { return Value(map, key) as object[] ?? new object[0]; }
-        private void AddResult(string name, string result, string code, string detail)
-        {
-            ListViewItem row = new ListViewItem(new string[] { name, result, code, detail }); row.ToolTipText = detail; results.Items.Add(row);
-        }
         public void ApplyResult(string json)
         {
             Dictionary<string, object> report = ResultChannel.Serializer().DeserializeObject(json) as Dictionary<string, object>;
             if (report == null || Value(report, "Status") == null) throw new InvalidDataException("Worker result has no status.");
-            results.Items.Clear(); errors.Clear(); primaryCode = "";
-            AddResult("Overall", TextValue(report, "Status"), "", "Results are kept in memory for this session.");
+            log.AppendText(Environment.NewLine + "Run finished: " + TextValue(report, "Status") + Environment.NewLine);
             Dictionary<string, object> restore = Value(report, "RestorePoint") as Dictionary<string, object>;
-            if (restore != null) AddResult("Restore point", TextValue(restore, "Status"), "", TextValue(restore, "CreatedUTC"));
+            if (restore != null) log.AppendText("Restore point: " + TextValue(restore, "Status") + Environment.NewLine);
             Dictionary<string, object> activation = Value(report, "Activation") as Dictionary<string, object>;
-            if (activation != null) AddResult("Office activation", TextValue(activation, "Status"), "", TextValue(activation, "Reason"));
+            if (activation != null) log.AppendText("Office activation: " + TextValue(activation, "Status") + ". " + TextValue(activation, "Reason") + Environment.NewLine);
             foreach (object item in Items(report, "Applications")) {
                 Dictionary<string, object> app = item as Dictionary<string, object>;
-                Dictionary<string, object> detail = Value(app, "Detail") as Dictionary<string, object>;
-                AddResult(TextValue(app, "Name"), TextValue(app, "Status"), TextValue(app, "ErrorCode"), TextValue(app, "Error") + TextValue(detail, "Artifact"));
+                log.AppendText(TextValue(app, "Name") + ": " + TextValue(app, "Status") + Environment.NewLine);
             }
             foreach (object item in Items(report, "Checks")) {
                 Dictionary<string, object> check = item as Dictionary<string, object>;
                 bool pass = Value(check, "Pass") is bool && (bool)Value(check, "Pass");
                 bool required = !(Value(check, "Required") is bool) || (bool)Value(check, "Required");
                 object evidence = Value(check, "Detail");
-                AddResult(TextValue(check, "Name"), pass ? "Passed" : required ? "Failed" : "Not required", "", evidence == null ? "" : ResultChannel.Serializer().Serialize(evidence));
+                if (required || !pass && TextValue(report, "Status") != "Complete")
+                    log.AppendText("Verify " + TextValue(check, "Name") + ": " + (pass ? "Passed" : required ? "Failed" : "Not verified")
+                        + (pass || evidence == null ? "" : ". " + ResultChannel.Serializer().Serialize(evidence)) + Environment.NewLine);
             }
             foreach (string severity in new string[] { "Error", "Pending", "Warning" })
                 foreach (object item in Items(report, "Issues")) {
                     Dictionary<string, object> issue = item as Dictionary<string, object>;
                     if (TextValue(issue, "Severity") != severity) continue;
-                    string issueCode = TextValue(issue, "Code"); if (primaryCode == "") primaryCode = issueCode;
-                    errors.AppendText("[" + issueCode + "] " + TextValue(issue, "Title") + " (" + severity + ")" + Environment.NewLine
-                        + TextValue(issue, "Message") + Environment.NewLine + "Next step: " + TextValue(issue, "Action") + Environment.NewLine
-                        + (Value(issue, "NativeCode") == null ? "" : "Native exit code: " + TextValue(issue, "NativeCode") + Environment.NewLine) + Environment.NewLine);
+                    ShowIssue(issue);
                 }
             foreach (object note in Items(report, "Notes")) log.AppendText(Convert.ToString(note) + Environment.NewLine);
             receivedResult = true; SetDetails(true); detailTabs.SelectedIndex = primaryCode == "" ? 0 : 1;
