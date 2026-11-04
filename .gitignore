@@ -1,0 +1,10 @@
+# Local deployment state and private backups never belong in the repository.
+config.json
+Reports/
+Runs/
+PreservedTeamsData/
+*.log
+*.user
+*.pdb
+obj/
+bin/

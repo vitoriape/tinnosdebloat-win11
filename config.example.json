@@ -1,0 +1,9 @@
+{
+  "LicenseEdition": "Business",
+  "Architecture": "64",
+  "Languages": ["pt-br", "en-us"],
+  "Channel": "Current",
+  "IncludeAccess": false,
+  "ExcludeOneDrive": true,
+  "ExcludeNewOutlook": true
+}

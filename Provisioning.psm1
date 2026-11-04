@@ -1,0 +1,839 @@
+#Requires -Version 5.1
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$script:ModuleRoot = $PSScriptRoot
+$script:OfficePolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Office\16.0\common\officeupdate'
+$script:BrowserPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+$script:TeamNames = @('MSTeams', 'MicrosoftTeams')
+$script:RequiredApps = [ordered]@{ Word='WINWORD.EXE'; Excel='EXCEL.EXE'; PowerPoint='POWERPNT.EXE'; Outlook='OUTLOOK.EXE'; OneNote='ONENOTE.EXE' }
+$script:Report = $null
+
+function Get-Value($Object, [string]$Name, $Default = $null) {
+    if ($null -ne $Object -and $null -ne $Object.PSObject.Properties[$Name]) { return $Object.$Name }
+    return $Default
+}
+
+function Get-OfficeProductId([string]$LicenseEdition) {
+    switch ($LicenseEdition) {
+        'Business' { return 'O365BusinessRetail' }
+        default { throw 'This build requires Microsoft 365 Apps for Business (O365BusinessRetail).' }
+    }
+}
+
+function Read-DeploymentConfig([string]$Path) {
+    $inputConfig = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if ($null -eq $inputConfig -or $inputConfig -isnot [pscustomobject]) { throw 'Configuration must be a JSON object.' }
+    $allowed = @('LicenseEdition','Architecture','Languages','Channel','IncludeAccess','ExcludeOneDrive','ExcludeNewOutlook')
+    foreach ($property in $inputConfig.PSObject.Properties) {
+        $key = $property.Name
+        if ($key -notin $allowed) { throw "Unknown configuration field: $key" }
+    }
+    $edition = Get-Value $inputConfig 'LicenseEdition' 'Business'
+    $null = Get-OfficeProductId $edition
+    $architecture = Get-Value $inputConfig 'Architecture' '64'
+    if ($architecture -notin @('32','64')) { throw 'Architecture must be 32 or 64.' }
+    $languages = @(Get-Value $inputConfig 'Languages' @('pt-br','en-us'))
+    if (!$languages.Count -or @($languages | Where-Object { $_ -notin @('pt-br','en-us') }).Count) { throw 'Languages must contain pt-br and/or en-us.' }
+    $channel = Get-Value $inputConfig 'Channel' 'Current'
+    if ($channel -notin @('Current','MonthlyEnterprise','SemiAnnual','SemiAnnualPreview','CurrentPreview','BetaChannel')) { throw 'Unsupported Office channel.' }
+    foreach ($name in @('IncludeAccess','ExcludeOneDrive','ExcludeNewOutlook')) {
+        if ($null -ne $inputConfig.PSObject.Properties[$name] -and $inputConfig.$name -isnot [bool]) { throw "$name must be a JSON boolean." }
+    }
+    [pscustomobject]@{
+        LicenseEdition=$edition; ProductId=(Get-OfficeProductId $edition); Architecture=[string]$architecture
+        Languages=@($languages | Select-Object -Unique); Channel=$channel
+        IncludeAccess=(Get-Value $inputConfig 'IncludeAccess' $false)
+        ExcludeOneDrive=(Get-Value $inputConfig 'ExcludeOneDrive' $true)
+        ExcludeNewOutlook=(Get-Value $inputConfig 'ExcludeNewOutlook' $true)
+    }
+}
+
+function Get-DesiredExclusions($Config, $Office) {
+    # Keep exclusions for unrelated apps during an existing-install reconfiguration.
+    $excluded = @('Teams','Lync','Publisher') + @(Get-Value $Office 'ExcludedApps' @())
+    if (!$Config.IncludeAccess) { $excluded += 'Access' }
+    if ($Config.ExcludeOneDrive) { $excluded += 'Groove'; $excluded += 'OneDrive' }
+    if ($Config.ExcludeNewOutlook) { $excluded += 'OutlookForWindows' }
+    $required = @('Word','Excel','PowerPoint','Outlook','OneNote')
+    if ($Config.IncludeAccess) { $required += 'Access' }
+    @($excluded | Where-Object { $_ -and $_ -notin $required } | Sort-Object -Unique)
+}
+
+function New-OfficeConfiguration($Config, $Office, [string]$Path) {
+    $xml = New-Object System.Xml.XmlDocument
+    $root = $xml.CreateElement('Configuration'); $null = $xml.AppendChild($root)
+    $add = $xml.CreateElement('Add'); $null = $root.AppendChild($add)
+    $add.SetAttribute('OfficeClientEdition', $Config.Architecture)
+    $add.SetAttribute('Channel', $Config.Channel)
+    $product = $xml.CreateElement('Product'); $product.SetAttribute('ID', $Config.ProductId); $null = $add.AppendChild($product)
+    $languages = @($Config.Languages) + @(Get-Value $Office 'Languages' @())
+    foreach ($language in @($languages | Where-Object { $_ } | Select-Object -Unique)) {
+        $node = $xml.CreateElement('Language'); $node.SetAttribute('ID', $language); $null = $product.AppendChild($node)
+    }
+    foreach ($app in @(Get-DesiredExclusions $Config $Office)) {
+        $node = $xml.CreateElement('ExcludeApp'); $node.SetAttribute('ID', $app); $null = $product.AppendChild($node)
+    }
+    $display = $xml.CreateElement('Display'); $display.SetAttribute('Level','None'); $display.SetAttribute('AcceptEULA','TRUE'); $null = $root.AppendChild($display)
+    $updates = $xml.CreateElement('Updates'); $updates.SetAttribute('Enabled','TRUE'); $updates.SetAttribute('Channel',$Config.Channel); $null = $root.AppendChild($updates)
+    # Never force-close an employee's open documents, migrate architecture, or remove other products.
+    $property = $xml.CreateElement('Property'); $property.SetAttribute('Name','FORCEAPPSHUTDOWN'); $property.SetAttribute('Value','FALSE'); $null = $root.AppendChild($property)
+    $xml.Save($Path)
+    return $xml
+}
+
+function Get-UninstallEntries([string]$Hive = 'HKLM:') {
+    foreach ($branch in @('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall','SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
+        $path = "$Hive\$branch"
+        if (Test-Path -LiteralPath $path) {
+            foreach ($key in @(Get-ChildItem -LiteralPath $path)) {
+                $entry = Get-ItemProperty -LiteralPath $key.PSPath
+                if (Get-Value $entry 'DisplayName') {
+                    [pscustomobject]@{
+                        Name=$entry.DisplayName; Key=$key.PSChildName; Version=(Get-Value $entry 'DisplayVersion')
+                        WindowsInstaller=(Get-Value $entry 'WindowsInstaller' 0)
+                        UninstallString=(Get-Value $entry 'UninstallString' '')
+                        Scope=$Hive
+                    }
+                }
+            }
+        }
+    }
+}
+
+function Test-TeamsEntry($Entry) {
+    $Entry.Name -match '^(Microsoft Teams(?: classic| \(work or school\)| \(personal\))?|Teams Machine-Wide Installer|Microsoft Teams Meeting Add-in for Microsoft Office)$'
+}
+
+function Get-OfficeState($Config) {
+    $path = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+    $c2r = if (Test-Path -LiteralPath $path) { Get-ItemProperty -LiteralPath $path } else { $null }
+    $roots = @("$env:ProgramFiles\Microsoft Office\root\Office16", "${env:ProgramFiles(x86)}\Microsoft Office\root\Office16")
+    $apps = [ordered]@{}
+    foreach ($app in $script:RequiredApps.Keys) { $apps[$app] = @($roots | ForEach-Object { Join-Path $_ $script:RequiredApps[$app] } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1) }
+    $apps['Access'] = @($roots | ForEach-Object { Join-Path $_ 'MSACCESS.EXE' } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+    $languages = @()
+    $releaseRoot = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\ProductReleaseIDs'
+    if (Test-Path -LiteralPath $releaseRoot) {
+        $languages += @(Get-ChildItem -LiteralPath $releaseRoot -Recurse | Where-Object { $_.PSChildName -match '^[a-z]{2}-[a-z]{2}$' } | ForEach-Object { $_.PSChildName.ToLowerInvariant() })
+    }
+    $culture = Get-Value $c2r 'ClientCulture'
+    if ($culture) { $languages += $culture.ToLowerInvariant() }
+    [pscustomobject]@{
+        Present=($null -ne $c2r); ProductIds=@(([string](Get-Value $c2r 'ProductReleaseIds' '') -split ',') | Where-Object { $_ })
+        Platform=(Get-Value $c2r 'Platform'); Version=(Get-Value $c2r 'VersionToReport')
+        Channel=(Get-Value $c2r 'UpdateChannel' (Get-Value $c2r 'CDNBaseUrl' ''))
+        ExcludedApps=@(([string](Get-Value $c2r "$($Config.ProductId).ExcludedApps" '') -split '[,; ]+') | Where-Object { $_ })
+        Languages=@($languages | Sort-Object -Unique); Apps=[pscustomobject]$apps
+        OtherOffice=@(Get-UninstallEntries | Where-Object { $_.Name -match 'Microsoft (Office|365)' })
+    }
+}
+
+function Test-OfficeMatches($Config, $Office) {
+    $channelIds = @{
+        Current='492350f6-3a01-4f97-b9c0-c7c6ddf67d60'; MonthlyEnterprise='55336b82-a18d-4dd6-b5f6-9e5095c314a6'
+        SemiAnnual='7ffbc6bf-bc32-4f92-8982-f9dd17fd3114'; SemiAnnualPreview='b8f9b850-328d-4355-9145-c59439a0c4cf'
+        CurrentPreview='64256afe-f5d9-4f86-8936-8840a6a4f5be'; BetaChannel='5440fd1f-7ecb-4221-8110-145efaa6372f'
+    }
+    if (!$Office.Present -or $Config.ProductId -notin $Office.ProductIds) { return $false }
+    if ($Office.Platform -ne "x$($Config.Architecture)") { return $false }
+    if ($Office.Channel -notmatch [regex]::Escape($channelIds[$Config.Channel])) { return $false }
+    foreach ($app in $script:RequiredApps.Keys) { if (!@(Get-Value $Office.Apps $app @()).Count) { return $false } }
+    if ($Config.IncludeAccess -and !@($Office.Apps.Access).Count) { return $false }
+    foreach ($language in $Config.Languages) { if ($language -notin $Office.Languages) { return $false } }
+    foreach ($app in @(Get-DesiredExclusions $Config $Office)) { if ($app -notin $Office.ExcludedApps) { return $false } }
+    return $true
+}
+
+function Use-ProfileHive($Profile, [scriptblock]$Action) {
+    $hive = "Registry::HKEY_USERS\$($Profile.SID)"
+    if (Test-Path -LiteralPath $hive) { return & $Action $hive }
+    $file = Join-Path $Profile.LocalPath 'NTUSER.DAT'
+    if (!(Test-Path -LiteralPath $file)) { throw "Profile hive unavailable: $($Profile.SID); connect/unlock the profile and rerun." }
+    $name = 'TinnosDebloat-Win11Audit_' + [guid]::NewGuid().ToString('N')
+    $null = & reg.exe load "HKU\$name" $file 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "Cannot inspect profile $($Profile.SID); sign out/unlock profile and rerun." }
+    try { & $Action "Registry::HKEY_USERS\$name" }
+    finally {
+        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        $null = & reg.exe unload "HKU\$name" 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Temporary hive HKU\$name could not be unloaded; administrator action required." }
+    }
+}
+
+function Get-TeamsStartup([string]$Hive) {
+    foreach ($branch in @('SOFTWARE\Microsoft\Windows\CurrentVersion\Run','SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run','SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce')) {
+        $path = "$Hive\$branch"
+        if (Test-Path -LiteralPath $path) {
+            $values = Get-ItemProperty -LiteralPath $path
+            foreach ($value in $values.PSObject.Properties) {
+                if ($value.Name -match '^(com\.squirrel\.Teams\.Teams|Teams|TeamsMachineInstaller|TeamsMachineUninstallerLocalAppData|TeamsMachineUninstallerProgramData)$' -or
+                    [string]$value.Value -match '(?i)(\\Microsoft\\Teams\\.*Update\.exe|\\Teams Installer\\Teams\.exe|\\MSTeams_[^\\]+\\ms-teams\.exe)') {
+                    [pscustomobject]@{ Path=$path; Name=$value.Name; Value=[string]$value.Value }
+                }
+            }
+        }
+    }
+    # Windows packaged-app startup state is per user. Keep disabled entries as evidence,
+    # but do not treat an inert entry left by Appx removal as an installed application.
+    foreach ($family in @('MSTeams_8wekyb3d8bbwe','MicrosoftTeams_8wekyb3d8bbwe')) {
+        $path = "$Hive\SOFTWARE\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\$family"
+        if (Test-Path -LiteralPath $path) {
+            foreach ($key in @(Get-ChildItem -LiteralPath $path)) {
+                if ($key.PSChildName -match 'Teams.*StartupTask') {
+                    $state = Get-Value (Get-ItemProperty -LiteralPath $key.PSPath) 'State'
+                    if ($null -ne $state -and [int]$state -in @(2,4)) {
+                        [pscustomobject]@{ Path=$key.PSPath; Name='State'; Value=[string]$state; PackagedStartup=$true }
+                    }
+                }
+            }
+        }
+    }
+}
+
+function Disable-TeamsStartup($Entry) {
+    if (Get-Value $Entry 'PackagedStartup' $false) {
+        if ([int]$Entry.Value -eq 4) { throw 'Teams startup is enabled by central policy; resolve the policy instead of overriding it.' }
+        # The supported startup task State=1 disables user autostart; never change shared app state.
+        $null = New-ItemProperty -LiteralPath $Entry.Path -Name State -PropertyType DWord -Value 1 -Force
+    } else { Remove-ItemProperty -LiteralPath $Entry.Path -Name $Entry.Name }
+}
+
+function Test-TeamsShortcut([string]$Target, [string]$Arguments, [string]$AppUserModelId) {
+    if ($Target -match '(?i)\\Microsoft(?:\\| )Teams\\current\\Teams\.exe$' -or
+        $Target -match '(?i)\\(?:WindowsApps\\MSTeams_[^\\]+|Microsoft\\WindowsApps)\\ms-teams\.exe$') { return $true }
+    if ($Target -match '(?i)\\Microsoft\\Teams\\Update\.exe$' -and $Arguments -match '(?i)(?:^|\s|["''])Teams\.exe(?:$|\s|["''])') { return $true }
+    if ($AppUserModelId -match '^(MSTeams|MicrosoftTeams)_8wekyb3d8bbwe!' -or
+        $Arguments -match '(?i)shell:AppsFolder\\(?:MSTeams|MicrosoftTeams)_8wekyb3d8bbwe!') { return $true }
+    return $false
+}
+
+function Get-TeamsShortcuts([string[]]$Roots) {
+    $shell = New-Object -ComObject WScript.Shell
+    $shellApplication = New-Object -ComObject Shell.Application
+    try {
+        foreach ($root in $Roots) {
+            if (!(Test-Path -LiteralPath $root)) { continue }
+            foreach ($file in @(Get-ChildItem -LiteralPath $root -Filter '*.lnk' -File -Recurse)) {
+                $link = $shell.CreateShortcut($file.FullName)
+                try {
+                    $appId = ''
+                    $folder = $null; $item = $null
+                    try {
+                        $folder = $shellApplication.NameSpace($file.DirectoryName)
+                        if ($null -ne $folder) {
+                            $item = $folder.ParseName($file.Name)
+                            if ($null -ne $item) { $appId = [string]$item.ExtendedProperty('System.AppUserModel.ID') }
+                        }
+                    } finally {
+                        if ($null -ne $item) { $null = [Runtime.InteropServices.Marshal]::ReleaseComObject($item) }
+                        if ($null -ne $folder) { $null = [Runtime.InteropServices.Marshal]::ReleaseComObject($folder) }
+                    }
+                    if (Test-TeamsShortcut $link.TargetPath $link.Arguments $appId) {
+                        [pscustomobject]@{ Path=$file.FullName; Target=$link.TargetPath }
+                    }
+                } finally { $null = [Runtime.InteropServices.Marshal]::ReleaseComObject($link) }
+            }
+        }
+    } finally {
+        $null = [Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+        $null = [Runtime.InteropServices.Marshal]::ReleaseComObject($shellApplication)
+    }
+}
+
+function Get-ProfileShortcutRoots([string]$LocalPath) {
+    @((Join-Path $LocalPath 'Desktop'), (Join-Path $LocalPath 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs'))
+}
+
+function Get-TeamsInventory {
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    $profiles = @(); $packages = @(); $provisioned = @(); $machine = @(); $startup = @(); $shortcuts = @(); $binaries = @()
+    try { $packages = @(Get-AppxPackage -AllUsers | Where-Object { $_.Name -in $script:TeamNames } | Select-Object Name,PackageFullName,PackageUserInformation) } catch { $errors.Add("Appx all-user enumeration: $_") }
+    try { $provisioned = @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -in $script:TeamNames } | Select-Object DisplayName,PackageName) } catch { $errors.Add("Provisioned package enumeration: $_") }
+    try { $machine = @(Get-UninstallEntries | Where-Object { Test-TeamsEntry $_ }); $startup = @(Get-TeamsStartup 'HKLM:') } catch { $errors.Add("Machine inventory: $_") }
+    try { $shortcuts = @(Get-TeamsShortcuts @("$env:PUBLIC\Desktop", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs")) } catch { $errors.Add("Machine shortcut inventory: $_") }
+    foreach ($path in @("${env:ProgramFiles(x86)}\Teams Installer\Teams.exe", "$env:ProgramFiles\Teams Installer\Teams.exe")) { if (Test-Path -LiteralPath $path) { $binaries += $path } }
+    try {
+        $localProfiles = @(Get-CimInstance Win32_UserProfile | Where-Object { !$_.Special })
+        foreach ($profile in $localProfiles) {
+            try {
+                $registry = Use-ProfileHive $profile { param($hive)
+                    [pscustomobject]@{ Entries=@(Get-UninstallEntries $hive | Where-Object { Test-TeamsEntry $_ }); Startup=@(Get-TeamsStartup $hive) }
+                }
+                $profileBinaries = @()
+                foreach ($relative in @('AppData\Local\Microsoft\Teams\current\Teams.exe','AppData\Local\Microsoft\Teams\Update.exe','AppData\Local\Microsoft\WindowsApps\ms-teams.exe')) {
+                    $candidate = Join-Path $profile.LocalPath $relative
+                    if (Test-Path -LiteralPath $candidate) { $profileBinaries += $candidate }
+                }
+                $addinFiles = @()
+                foreach ($relative in @('AppData\Local\Microsoft\TeamsMeetingAddin','AppData\Local\Microsoft\TeamsMeetingAdd-in')) {
+                    $addin = Join-Path $profile.LocalPath $relative
+                    if (Test-Path -LiteralPath $addin) { $addinFiles += @(Get-ChildItem -LiteralPath $addin -Filter 'Microsoft.Teams.AddinLoader.dll' -File -Recurse | Select-Object -ExpandProperty FullName) }
+                }
+                $profiles += [pscustomobject]@{ SID=$profile.SID; LocalPath=$profile.LocalPath; Loaded=$profile.Loaded
+                    Entries=$registry.Entries; Startup=$registry.Startup; Binaries=$profileBinaries; AddinFiles=@($addinFiles)
+                    Shortcuts=@(Get-TeamsShortcuts (Get-ProfileShortcutRoots $profile.LocalPath)) }
+            } catch { $errors.Add("Profile $($profile.SID): $_") }
+        }
+    } catch { $errors.Add("Profile enumeration: $_") }
+    $machineAddins = @()
+    foreach ($root in @("$env:ProgramFiles\Microsoft\TeamsMeetingAddin", "${env:ProgramFiles(x86)}\Microsoft\TeamsMeetingAddin", "$env:ProgramFiles\Microsoft\TeamsMeetingAdd-in", "${env:ProgramFiles(x86)}\Microsoft\TeamsMeetingAdd-in")) {
+        try { if (Test-Path -LiteralPath $root) { $machineAddins += @(Get-ChildItem -LiteralPath $root -Filter 'Microsoft.Teams.AddinLoader.dll' -File -Recurse | Select-Object -ExpandProperty FullName) } } catch { $errors.Add("Add-in inventory: $_") }
+    }
+    [pscustomobject]@{ Packages=$packages; Provisioned=$provisioned; MachineEntries=$machine; MachineBinaries=$binaries
+        MachineStartup=$startup; MachineShortcuts=$shortcuts; MachineAddinFiles=$machineAddins; Profiles=$profiles; Errors=@($errors.ToArray())
+        Scope='All non-special Win32_UserProfile local profiles and all-user Appx/provisioning. Detached/remote profile containers must be audited when attached.' }
+}
+
+function Test-TeamsAbsent($Inventory) {
+    if (@($Inventory.Errors).Count) { return $false }
+    foreach ($name in @('Packages','Provisioned','MachineEntries','MachineBinaries','MachineStartup','MachineShortcuts','MachineAddinFiles')) {
+        if (@($Inventory.$name).Count) { return $false }
+    }
+    foreach ($profile in $Inventory.Profiles) {
+        foreach ($name in @('Entries','Startup','Binaries','Shortcuts','AddinFiles')) { if (@($profile.$name).Count) { return $false } }
+    }
+    return $true
+}
+
+function Invoke-Installer([string]$FilePath, [string]$Arguments, [int[]]$SuccessCodes = @(0,3010,1641)) {
+    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WindowStyle Hidden -Wait -PassThru
+    if ($process.ExitCode -notin $SuccessCodes) { throw "$([IO.Path]::GetFileName($FilePath)) failed with exit code $($process.ExitCode)." }
+    if ($null -ne $script:Report -and $process.ExitCode -in @(3010,1641)) { $script:Report.RebootRequired = $true }
+    if ($null -ne $script:Report) { $script:Report.Operations += [pscustomobject]@{ Executable=[IO.Path]::GetFileName($FilePath); Arguments=$Arguments; ExitCode=$process.ExitCode } }
+    return $process.ExitCode
+}
+
+function Assert-Publisher([string]$Path, [ValidateSet('Microsoft','Google')][string]$Publisher) {
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch "O=$Publisher (Corporation|LLC|Inc\.)[, ]") {
+        throw "Invalid $Publisher Authenticode signature: $Path"
+    }
+}
+
+function Get-TrustedDownload([string]$Url, [string]$Path, [string]$Publisher) {
+    $uri = [uri]$Url
+    $allowedHost = if ($Publisher -eq 'Microsoft') { '(^|\.)microsoft\.com$' } else { '^dl\.google\.com$' }
+    if ($uri.Scheme -ne 'https' -or $uri.Host -notmatch $allowedHost) { throw "Unexpected download origin: $Url" }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $uri -OutFile $Path -UseBasicParsing
+    Assert-Publisher $Path $Publisher
+    $script:Report.Downloads += [pscustomobject]@{ Url=$Url; File=$Path; SHA256=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash; Publisher=$Publisher }
+    return $Path
+}
+
+function Remove-TeamsMsi($Entry, [string]$LogDirectory) {
+    if (!(Test-TeamsEntry $Entry)) { throw 'Refusing to uninstall an unrelated product.' }
+    if ($Entry.Key -notmatch '^\{[0-9A-Fa-f-]{36}\}$' -or $Entry.WindowsInstaller -ne 1) { throw "Unsupported Teams uninstaller for $($Entry.Name); use its supported uninstaller in the correct user context." }
+    if ($Entry.Name -match 'Meeting Add-in' -and @(Get-Process OUTLOOK -ErrorAction SilentlyContinue).Count) { throw 'Close Outlook before removing the Teams Meeting Add-in; no application was force-closed.' }
+    $log = Join-Path $LogDirectory ("teams-{0}.log" -f $Entry.Key.Trim('{}'))
+    $null = Invoke-Installer "$env:WINDIR\System32\msiexec.exe" "/x $($Entry.Key) /qn /norestart /L*v `"$log`"" @(0,1605,1614,3010,1641)
+}
+
+function Invoke-TeamsUserCleanup {
+    $script:Report = [pscustomobject]@{ RebootRequired=$false; Operations=@() }
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $logDir = Join-Path $env:LOCALAPPDATA 'TinnosDebloat-Win11\DeploymentLogs'
+    $null = New-Item -Path $logDir -ItemType Directory -Force
+    $updater = Join-Path $env:LOCALAPPDATA 'Microsoft\Teams\Update.exe'
+    if (Test-Path -LiteralPath $updater) {
+        try { Assert-Publisher $updater 'Microsoft'; $null = Invoke-Installer $updater '--uninstall -s' } catch { $errors.Add([string]$_) }
+    }
+    foreach ($entry in @(Get-UninstallEntries 'HKCU:' | Where-Object { Test-TeamsEntry $_ })) {
+        try { Remove-TeamsMsi $entry $logDir } catch { $errors.Add([string]$_) }
+    }
+    foreach ($entry in @(Get-TeamsStartup 'HKCU:')) {
+        try { Disable-TeamsStartup $entry } catch { $errors.Add([string]$_) }
+    }
+    foreach ($link in @(Get-TeamsShortcuts (Get-ProfileShortcutRoots $env:USERPROFILE))) {
+        try { Remove-Item -LiteralPath $link.Path } catch { $errors.Add([string]$_) }
+    }
+    [pscustomobject]@{ SID=$sid; Time=(Get-Date).ToUniversalTime().ToString('o'); RebootRequired=$script:Report.RebootRequired; Operations=$script:Report.Operations; Errors=@($errors.ToArray()) }
+}
+
+function Initialize-ProtectedDirectory([string]$Path, [switch]$AdministratorsOnly) {
+    $null = New-Item -Path $Path -ItemType Directory -Force
+    $item = Get-Item -LiteralPath $Path
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing reparse-point deployment directory: $Path" }
+    # Protect scheduled task code, installers, configuration and reports from standard-user replacement.
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true,$false)
+    $rules = @(@('S-1-5-18','FullControl'),@('S-1-5-32-544','FullControl'))
+    if (!$AdministratorsOnly) { $rules += ,@('S-1-5-32-545','ReadAndExecute') }
+    foreach ($pair in $rules) {
+        $identity = New-Object Security.Principal.SecurityIdentifier($pair[0])
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity,$pair[1],'ContainerInherit,ObjectInherit','None','Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Backup-TeamsUserData($Inventory, [string]$Directory) {
+    # Appx removal can remove application data; PreserveApplicationData does not work
+    # for production Store packages. Preserve complete Teams stores before uninstall.
+    if (@($Inventory.Errors).Count) { throw 'All profiles must be inspectable before Teams data can be preserved. No Teams removal was started.' }
+    if (Test-TeamsAbsent $Inventory) { return }
+    if (@(Get-Process Teams,ms-teams,msteams -ErrorAction SilentlyContinue).Count) { throw 'Close Teams in every active session before preserving data and removing it. No Teams process was force-closed.' }
+    $backupRoot = Join-Path $Directory 'PreservedTeamsData'
+    Initialize-ProtectedDirectory $backupRoot -AdministratorsOnly
+    foreach ($profile in $Inventory.Profiles) {
+        foreach ($relative in @('AppData\Local\Packages\MSTeams_8wekyb3d8bbwe', 'AppData\Local\Packages\MicrosoftTeams_8wekyb3d8bbwe',
+            'AppData\Local\Microsoft\Teams', 'AppData\Local\Microsoft Teams', 'AppData\Roaming\Microsoft\Teams',
+            'AppData\Local\Publishers\8wekyb3d8bbwe\TeamsSharedConfig')) {
+            $source = Join-Path $profile.LocalPath $relative
+            if (!(Test-Path -LiteralPath $source)) { continue }
+            $sourceItem = Get-Item -LiteralPath $source -Force
+            $reparse = @($sourceItem) + @(Get-ChildItem -LiteralPath $source -Force -Recurse)
+            if (@($reparse | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) {
+                throw "Teams data contains redirected/reparse paths: $source. Preserve its target through your backup process before retrying; no removal was started."
+            }
+            $target = Join-Path (Join-Path $backupRoot $profile.SID) $relative
+            $null = New-Item -Path $target -ItemType Directory -Force
+            $log = Join-Path $backupRoot 'copy.log'
+            $null = & "$env:WINDIR\System32\robocopy.exe" $source $target /E /COPY:DAT /DCOPY:DAT /XJ /R:0 /W:0 /NFL /NDL /NP "/LOG+:$log"
+            if ($LASTEXITCODE -ge 8) { throw "Teams data backup failed for $($profile.SID) (robocopy $LASTEXITCODE). Close Teams/sign out and rerun; no removal was started. Log: $log" }
+            $script:Report.PreservedData += [pscustomobject]@{ SID=$profile.SID; Source=$source; Backup=$target; CopyExitCode=$LASTEXITCODE }
+        }
+    }
+}
+
+function Get-UserCleanupResults($Inventory, [switch]$RemoveCompleted) {
+    $lastBoot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime()
+    foreach ($task in @(Get-ScheduledTask -TaskName 'TinnosDebloat-Win11-RemoveTeams-*' -ErrorAction SilentlyContinue)) {
+        $sid = $task.TaskName -replace '^TinnosDebloat-Win11-RemoveTeams-', ''
+        $profile = @($Inventory.Profiles | Where-Object { $_.SID -eq $sid })
+        $info = Get-ScheduledTaskInfo -TaskName $task.TaskName
+        $result = $null
+        $match = [regex]::Match([string]$task.Actions[0].Arguments, '-ResultPath "([^"]+)"')
+        if ($match.Success -and (Test-Path -LiteralPath $match.Groups[1].Value)) {
+            try { $result = Get-Content -LiteralPath $match.Groups[1].Value -Raw | ConvertFrom-Json } catch { $script:Report.Notes += "Unreadable user result for $sid; independent inventory remains authoritative." }
+        }
+        if ($null -ne $result -and (Get-Value $result 'RebootRequired' $false)) {
+            $resultTime = Get-Value $result 'Time'
+            if (!$resultTime -or [datetime]::Parse($resultTime).ToUniversalTime() -gt $lastBoot) { $script:Report.RebootRequired = $true }
+        }
+        $script:Report.UserCleanup += [pscustomobject]@{ SID=$sid; TaskName=$task.TaskName; State=[string]$task.State; LastTaskResult=$info.LastTaskResult; LastRunTime=$info.LastRunTime; Result=$result }
+        $remaining = $true
+        if ($profile.Count -eq 1) {
+            $remaining = $false
+            foreach ($field in @('Entries','Binaries','Startup','Shortcuts','AddinFiles')) { if (@($profile[0].$field).Count) { $remaining = $true } }
+        }
+        if (!$remaining -and !@($Inventory.Errors).Count -and $task.State -ne 'Running') {
+            if ($RemoveCompleted) {
+                Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false
+                $script:Report.Pending = @($script:Report.Pending | Where-Object { $_ -notlike "User cleanup scheduled: $($task.TaskName).*" })
+                $script:Report.Notes += "Completed cleanup task removed: $($task.TaskName). Preserved user data and logs retained."
+            }
+        } else { $script:Report.Pending += "Profile cleanup requires sign-in/retry: $($task.TaskName); task state $($task.State), last result $($info.LastTaskResult)." }
+    }
+}
+
+function Register-UserCleanup($Profile, [string]$Directory) {
+    $code = Join-Path $Directory 'UserCleanup'
+    Initialize-ProtectedDirectory $code
+    foreach ($file in @('Invoke-UserCleanup.ps1','Provisioning.psm1')) { Copy-Item -LiteralPath (Join-Path $script:ModuleRoot $file) -Destination $code -Force }
+    $resultDir = Join-Path $code $Profile.SID
+    Initialize-ProtectedDirectory $resultDir
+    $acl = Get-Acl -LiteralPath $resultDir
+    $identity = New-Object Security.Principal.SecurityIdentifier($Profile.SID)
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($identity,'Modify','ContainerInherit,ObjectInherit','None','Allow')))
+    Set-Acl -LiteralPath $resultDir -AclObject $acl
+    $resultFile = Join-Path $resultDir 'result.json'
+    $name = 'TinnosDebloat-Win11-RemoveTeams-' + $Profile.SID
+    $action = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$code\Invoke-UserCleanup.ps1`" -ResultPath `"$resultFile`""
+    $principal = New-ScheduledTaskPrincipal -UserId $Profile.SID -LogonType Interactive -RunLevel Limited
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $Profile.SID
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -MultipleInstances IgnoreNew
+    $null = Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Trigger $trigger -Settings $settings -Force
+    if ($Profile.Loaded) { try { Start-ScheduledTask -TaskName $name } catch { $script:Report.Pending += "Sign into profile $($Profile.SID) to complete cleanup: $_" } }
+    $script:Report.Pending += "User cleanup scheduled: $name. Sign in, close Outlook/Teams, then rerun Audit or Deploy. Result: $resultFile"
+}
+
+function Remove-TeamsApplications($Inventory, $Config, [string]$Directory) {
+    Backup-TeamsUserData $Inventory $Directory
+    if (@($Inventory.Packages).Count) {
+        try {
+            $bootstrapper = Get-TrustedDownload 'https://go.microsoft.com/fwlink/?linkid=2243204&clcid=0x409' (Join-Path $Directory 'teamsbootstrapper.exe') 'Microsoft'
+            # This is exclusively uninstall mode. Never pass -p or install a Teams MSIX.
+            $null = Invoke-Installer $bootstrapper '-x -m'
+        } catch { $script:Report.Errors += "Teams bootstrapper: $_" }
+    }
+    foreach ($entry in $Inventory.MachineEntries) {
+        try { Remove-TeamsMsi $entry $Directory } catch { $script:Report.Pending += "Machine component $($entry.Name): $_" }
+    }
+    foreach ($package in $Inventory.Packages) {
+        try { Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop } catch { $script:Report.Pending += "Appx $($package.PackageFullName): $_" }
+    }
+    foreach ($profile in $Inventory.Profiles) {
+        if (@($profile.Entries).Count -or @($profile.Binaries).Count -or @($profile.Startup).Count -or @($profile.Shortcuts).Count -or @($profile.AddinFiles).Count) {
+            try { Register-UserCleanup $profile $Directory } catch { $script:Report.Errors += "Cannot schedule cleanup for $($profile.SID): $_" }
+        }
+    }
+    foreach ($entry in $Inventory.MachineStartup) { Disable-TeamsStartup $entry }
+    foreach ($link in $Inventory.MachineShortcuts) { Remove-Item -LiteralPath $link.Path }
+}
+
+function Assert-TeamsRemovalComplete {
+    $inventory = Get-TeamsInventory
+    if (@($inventory.Errors).Count) { throw ('Cannot verify Teams removal: ' + ($inventory.Errors -join '; ')) }
+    if (!(Test-TeamsAbsent $inventory)) {
+        $exception = New-Object InvalidOperationException('Teams removal is pending. Close Teams/Outlook, sign into affected profiles or reboot as reported, then rerun Deploy. Office, Chrome and Drive installation has not started.')
+        $exception.Data['PendingAction'] = $true
+        throw $exception
+    }
+}
+
+function Remove-TeamsProvisioning($Inventory) {
+    foreach ($package in $Inventory.Provisioned) {
+        try {
+            $result = Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName -AllUsers -ErrorAction Stop
+            if ($result.RestartNeeded) { $script:Report.RebootRequired = $true }
+        } catch { $script:Report.Pending += "Provisioning $($package.PackageName): $_" }
+    }
+}
+
+function Get-PolicyEvidence {
+    $effective = if (Test-Path -LiteralPath $script:OfficePolicy) { Get-Value (Get-ItemProperty -LiteralPath $script:OfficePolicy) 'preventteamsinstall' } else { $null }
+    $evidence = @(); $conflicts = @(); $errors = @()
+    $domainJoined = (Get-CimInstance Win32_ComputerSystem).PartOfDomain
+    try {
+        $rsop = @(Get-CimInstance -Namespace 'root\RSOP\Computer' -ClassName RSOP_RegistryPolicySetting -ErrorAction Stop)
+        foreach ($row in $rsop) {
+            if ($row.valueName -match 'preventteamsinstall|DefaultAssociationsConfiguration|updatebranch|updatepath|updatechannel') {
+                $evidence += [pscustomobject]@{ Source='GroupPolicy'; Key=$row.keyName; Name=$row.valueName; Value=$row.value; GPO=(Get-Value $row 'GPOID') }
+                if ($row.valueName -eq 'preventteamsinstall') {
+                    $value = $row.value
+                    if ($value -is [array] -and $value.Count -ge 4) { $value = [BitConverter]::ToUInt32([byte[]]$value,0) }
+                    if ([string]$value -eq '0') { $conflicts += "Group Policy disables Teams installation prevention: $($row.keyName). Resolve in the originating GPO." }
+                }
+            }
+        }
+    } catch { if ($domainJoined) { $errors += "Cannot inspect domain RSoP: $_" } }
+    $mdmRoot = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device'
+    if (Test-Path -LiteralPath $mdmRoot) {
+        try {
+            foreach ($key in @(Get-ChildItem -LiteralPath $mdmRoot -Recurse)) {
+                if ($key.Name -match 'Office|ApplicationDefaults|Teams') {
+                    $properties = Get-ItemProperty -LiteralPath $key.PSPath
+                    foreach ($property in $properties.PSObject.Properties) {
+                        if ($property.Name -notmatch '^PS' -and ($property.Name -match 'preventteamsinstall|DefaultAssociationsConfiguration|updatebranch|updatechannel' -or $key.Name -match 'PreventTeamsInstall')) {
+                            $evidence += [pscustomobject]@{ Source='MDM'; Key=$key.Name; Name=$property.Name; Value=$property.Value }
+                            if ($property.Name -notmatch '_ProviderSet|_WinningProvider' -and ($property.Name -match 'preventteamsinstall' -or $key.Name -match 'PreventTeamsInstall') -and [string]$property.Value -match '^(0|<disabled\s*/>)$') {
+                                $conflicts += "MDM disables Teams install prevention: $($key.Name) / $($property.Name)"
+                            }
+                        }
+                    }
+                }
+            }
+        } catch { $errors += "Cannot inspect effective MDM policy: $_" }
+    }
+    if ($null -ne $effective -and [int]$effective -ne 1) { $conflicts += 'Existing preventteamsinstall policy is not 1; the tool will not overwrite it.' }
+    $officeValues = if (Test-Path -LiteralPath $script:OfficePolicy) { Get-ItemProperty -LiteralPath $script:OfficePolicy } else { $null }
+    $updatePolicies = @()
+    foreach ($name in @('updatebranch','updatepath','updatechannel','officemgmtcom','enableautomaticupdates')) {
+        $value = Get-Value $officeValues $name
+        if ($null -ne $value) { $updatePolicies += [pscustomobject]@{ Name=$name; Value=$value } }
+    }
+    [pscustomobject]@{ PreventTeamsInstall=$effective; Evidence=$evidence; Conflicts=$conflicts; Errors=$errors; UpdatePolicies=$updatePolicies; DomainJoined=$domainJoined
+        Note='Effective local GPO/MDM evidence only. Tenant app assignments and Office cloud Modern Apps settings require administrator review; no central policies are changed.' }
+}
+
+function Set-TeamsPrevention($Evidence) {
+    if (@($Evidence.Conflicts).Count -or @($Evidence.Errors).Count) { throw 'Teams policy conflict or unreadable central policy evidence; resolve centrally before Office installation.' }
+    if ($null -eq $Evidence.PreventTeamsInstall) {
+        $null = New-Item -Path $script:OfficePolicy -Force
+        $null = New-ItemProperty -LiteralPath $script:OfficePolicy -Name preventteamsinstall -PropertyType DWord -Value 1
+    }
+    if ([int](Get-ItemProperty -LiteralPath $script:OfficePolicy).preventteamsinstall -ne 1) { throw 'Teams prevention policy verification failed.' }
+}
+
+function Resolve-OfficialOdtUrl([string]$Content) {
+    $normalized = [Net.WebUtility]::HtmlDecode($Content).Replace('\/', '/')
+    $match = [regex]::Match($normalized, 'https://download\.microsoft\.com/[^"\s<>]*officedeploymenttool[^"\s<>]*\.exe', 'IgnoreCase')
+    if (!$match.Success) { throw 'Microsoft Download Center did not provide a recognizable official ODT link. No alternative installer was used; retry later.' }
+    return $match.Value
+}
+
+function Get-OdtSetup($Config, [string]$Directory) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $page = Invoke-WebRequest -Uri 'https://www.microsoft.com/en-us/download/details.aspx?id=49117' -UseBasicParsing
+    $url = Resolve-OfficialOdtUrl $page.Content
+    $archive = Get-TrustedDownload $url (Join-Path $Directory 'officedeploymenttool.exe') 'Microsoft'
+    $extract = Join-Path $Directory 'ODT'
+    $null = New-Item -Path $extract -ItemType Directory -Force
+    $null = Invoke-Installer $archive "/quiet /extract:`"$extract`"" @(0)
+    $setup = Join-Path $extract 'setup.exe'
+    Assert-Publisher $setup 'Microsoft'
+    $info = (Get-Item -LiteralPath $setup).VersionInfo
+    if ($info.OriginalFilename -notmatch '^setup\.exe$' -or ($info.FileDescription -notmatch 'Office' -and $info.ProductName -notmatch 'Office')) { throw 'The supplied executable is not Office setup.exe.' }
+    return $setup
+}
+
+function Install-Office($Config, $Office, $Policies, [string]$XmlPath, [string]$Directory) {
+    if (Test-OfficeMatches $Config $Office) { $script:Report.Notes += 'Office already matches requested applications, product, architecture, languages, channel and exclusions; ODT skipped.'; return }
+    if ($Office.Present -and ($Office.Platform -ne "x$($Config.Architecture)" -or $Config.ProductId -notin $Office.ProductIds)) { throw 'Existing Office architecture/license product differs. Plan an administrator-approved migration; automatic removal is disabled.' }
+    if (!$Office.Present -and @($Office.OtherOffice).Count) { throw 'Existing nonmatching Office installation detected. Resolve compatibility before deploying Microsoft 365.' }
+    if (@($Policies.UpdatePolicies).Count) { throw 'Office update settings are centrally configured. Align this configuration centrally before changing Office; existing update policies were preserved.' }
+    if (@(Get-Process WINWORD,EXCEL,POWERPNT,OUTLOOK,ONENOTE,MSACCESS -ErrorAction SilentlyContinue).Count) { throw 'Close Office applications and rerun; installation will not force-close documents.' }
+    $setup = Get-OdtSetup $Config $Directory
+    $null = Invoke-Installer $setup "/download `"$XmlPath`"" @(0)
+    $null = Invoke-Installer $setup "/configure `"$XmlPath`""
+}
+
+function Get-GoogleApps {
+    $chrome = @(@("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+    $drive = @()
+    foreach ($root in @("$env:ProgramFiles\Google\Drive File Stream", "${env:ProgramFiles(x86)}\Google\Drive File Stream")) {
+        if (Test-Path -LiteralPath $root) { $drive += @(Get-ChildItem -LiteralPath $root -Filter GoogleDriveFS.exe -File -Recurse | Select-Object -ExpandProperty FullName) }
+    }
+    [pscustomobject]@{ Chrome=@($chrome); Drive=@($drive) }
+}
+
+function Install-GoogleChrome([string]$Directory) {
+    if (@((Get-GoogleApps).Chrome).Count) { return }
+    $msi = Get-TrustedDownload 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi' (Join-Path $Directory 'chrome.msi') 'Google'
+    $null = Invoke-Installer "$env:WINDIR\System32\msiexec.exe" "/i `"$msi`" /qn /norestart /L*v `"$Directory\chrome.log`""
+}
+
+function Install-GoogleDrive([string]$Directory) {
+    if (@((Get-GoogleApps).Drive).Count) { return }
+    $setup = Get-TrustedDownload 'https://dl.google.com/drive-file-stream/GoogleDriveSetup.exe' (Join-Path $Directory 'GoogleDriveSetup.exe') 'Google'
+    $null = Invoke-Installer $setup '--silent --desktop_shortcut --skip_launch_new'
+}
+
+function New-ChromeAssociations([string]$Path) {
+    $xml = New-Object System.Xml.XmlDocument
+    $root = $xml.CreateElement('DefaultAssociations'); $null = $xml.AppendChild($root)
+    foreach ($identifier in @('.htm','.html','http','https')) {
+        $node = $xml.CreateElement('Association'); $node.SetAttribute('Identifier',$identifier)
+        $node.SetAttribute('ProgId','ChromeHTML'); $node.SetAttribute('ApplicationName','Google Chrome'); $null = $root.AppendChild($node)
+    }
+    $xml.Save($Path)
+}
+
+function Set-ChromeDefault([string]$Directory, $Evidence) {
+    if (!(Test-Path -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\ChromeHTML')) { throw 'Machine ChromeHTML registration is missing.' }
+    $target = Join-Path $Directory 'chrome-associations.xml'
+    New-ChromeAssociations $target
+    $existing = if (Test-Path -LiteralPath $script:BrowserPolicy) { Get-Value (Get-ItemProperty -LiteralPath $script:BrowserPolicy) 'DefaultAssociationsConfiguration' } else { $null }
+    if (@($Evidence.Evidence | Where-Object { $_.Source -eq 'MDM' -and $_.Name -match 'DefaultAssociationsConfiguration' }).Count) { throw 'MDM controls default associations; deploy the generated Chrome associations through Intune. Existing policy preserved.' }
+    if ($existing -and (Test-ChromeAssociationFile $existing)) {
+        $script:Report.Notes += 'Existing default association policy already selects Chrome; its path and all unrelated mappings were preserved.'
+        return
+    }
+    if ($existing -and $existing -ne $target) { throw "Existing default association policy preserved: $existing. Merge Chrome mappings centrally." }
+    $null = Invoke-Installer "$env:WINDIR\System32\dism.exe" "/Online /Import-DefaultAppAssociations:`"$target`"" @(0,3010)
+    $null = New-Item -Path $script:BrowserPolicy -Force
+    $null = New-ItemProperty -LiteralPath $script:BrowserPolicy -Name DefaultAssociationsConfiguration -Value $target -PropertyType String -Force
+    $script:Report.Notes += 'Chrome defaults configured through DISM and supported association policy. Existing sessions apply at next sign-in; UserChoice hashes are never modified.'
+}
+
+function Test-ChromeAssociationFile([string]$Path) {
+    try {
+        [xml]$xml = Get-Content -LiteralPath $Path -Raw
+        foreach ($id in @('.htm','.html','http','https')) {
+            if (!@($xml.DefaultAssociations.Association | Where-Object { $_.Identifier -eq $id -and $_.ProgId -eq 'ChromeHTML' }).Count) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Get-OfficeActivation([string]$ProductId) {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $paths = @("$env:ProgramFiles\Microsoft Office\Office16\vnextdiag.ps1", "$env:ProgramFiles\Microsoft Office\root\Office16\vnextdiag.ps1",
+        "${env:ProgramFiles(x86)}\Microsoft Office\Office16\vnextdiag.ps1", "${env:ProgramFiles(x86)}\Microsoft Office\root\Office16\vnextdiag.ps1")
+    $diagnostic = $paths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (!$diagnostic) { return [pscustomobject]@{ Status='Unknown'; ContextSID=$sid; Reason='vnextdiag.ps1 unavailable; sign in to Office and run Check-OfficeActivation.ps1 as the employee.' } }
+    try {
+        $output = @(& "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $diagnostic -action list 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw "vnextdiag exit $LASTEXITCODE" }
+        # vnextdiag returns one JSON object per license. Avoid mixing another product's Licensed state.
+        $blocks = [regex]::Matches($output,'(?s)\{[^{}]*\}')
+        $licenses = @()
+        foreach ($block in $blocks) {
+            try {
+                $license = $block.Value | ConvertFrom-Json
+                $product = Get-Value $license 'Product'
+                if ($product -eq $ProductId) { $licenses += [pscustomobject]@{ Product=$product; State=(Get-Value $license 'LicenseState' (Get-Value $license 'State' 'Unknown')); Type=(Get-Value $license 'LicenseType' (Get-Value $license 'Type' 'Unknown')) } }
+            } catch { continue }
+        }
+        $status = if (@($licenses | Where-Object { $_.State -eq 'Licensed' }).Count) { 'Licensed' } elseif ($licenses.Count) { 'NotLicensed' } else { 'Unknown' }
+        [pscustomobject]@{ Status=$status; ContextSID=$sid; ProductId=$ProductId; Licenses=$licenses
+            Reason='Read-only vnextdiag -action list in this execution account. Employee activation is separate; sign in with a licensed Microsoft 365 account. No tokens, email addresses or keys are collected.' }
+    } catch { [pscustomobject]@{ Status='Unknown'; ContextSID=$sid; Reason=[string]$_ } }
+}
+
+function Get-DeploymentChecks($Config, $Office, $Teams, $Policies, $Google, [string]$Directory) {
+    $checks = @()
+    foreach ($app in $script:RequiredApps.Keys) { $checks += [pscustomobject]@{ Name=$app; Pass=(@(Get-Value $Office.Apps $app @()).Count -gt 0); Detail=@(Get-Value $Office.Apps $app @()) } }
+    if ($Config.IncludeAccess) { $checks += [pscustomobject]@{ Name='Access'; Pass=(@($Office.Apps.Access).Count -gt 0); Detail=$Office.Apps.Access } }
+    $checks += [pscustomobject]@{ Name='Chrome'; Pass=(@($Google.Chrome).Count -gt 0); Detail=$Google.Chrome }
+    $checks += [pscustomobject]@{ Name='GoogleDrive'; Pass=(@($Google.Drive).Count -gt 0); Detail=$Google.Drive }
+    $checks += [pscustomobject]@{ Name='TeamsCompletelyAbsent'; Pass=(Test-TeamsAbsent $Teams); Detail=$Teams }
+    $checks += [pscustomobject]@{ Name='NoTeamsMachineWideInstaller'; Pass=(!@($Teams.MachineEntries | Where-Object { $_.Name -eq 'Teams Machine-Wide Installer' }).Count -and !@($Teams.MachineBinaries).Count); Detail=$Teams.MachineEntries }
+    $checks += [pscustomobject]@{ Name='NoTeamsProvisioning'; Pass=(!@($Teams.Provisioned).Count); Detail=$Teams.Provisioned }
+    $checks += [pscustomobject]@{ Name='TeamsPreventionPolicy'; Pass=($Policies.PreventTeamsInstall -eq 1 -and !@($Policies.Conflicts).Count -and !@($Policies.Errors).Count); Detail=$Policies }
+    $checks += [pscustomobject]@{ Name='OfficeConfiguration'; Pass=(Test-OfficeMatches $Config $Office); Detail=$Office }
+    $checks += [pscustomobject]@{ Name='OfficeTeamsExcluded'; Pass=('Teams' -in $Office.ExcludedApps); Detail=$Office.ExcludedApps }
+    $policyPath = if (Test-Path -LiteralPath $script:BrowserPolicy) { Get-Value (Get-ItemProperty -LiteralPath $script:BrowserPolicy) 'DefaultAssociationsConfiguration' } else { $null }
+    $browserValid = $false
+    try {
+        if ($policyPath) {
+            [xml]$associations = Get-Content -LiteralPath $policyPath -Raw
+            $browserValid = $true
+            foreach ($id in @('.htm','.html','http','https')) {
+                if (!@($associations.DefaultAssociations.Association | Where-Object { $_.Identifier -eq $id -and $_.ProgId -eq 'ChromeHTML' }).Count) { $browserValid = $false }
+            }
+        }
+    } catch { $browserValid = $false }
+    $checks += [pscustomobject]@{ Name='ChromeDefaultPolicy'; Pass=$browserValid; Detail="Policy: $policyPath. Existing sessions require next sign-in; this check does not claim that every current UserChoice has changed." }
+    return $checks
+}
+
+function Get-DeploymentStatus($Checks, $Errors, [bool]$RebootRequired, $Pending) {
+    if (@($Errors).Count) { return 'Failed' }
+    if (!@($Checks).Count) { return 'Failed' }
+    if (@($Checks | Where-Object { !$_.Pass }).Count) {
+        if (@($Pending).Count -or $RebootRequired) { return 'Pending' }
+        return 'Failed'
+    }
+    if ($RebootRequired -or @($Pending).Count) { return 'Pending' }
+    return 'Complete'
+}
+
+function Get-PendingRebootReasons {
+    foreach ($path in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')) {
+        if (Test-Path -LiteralPath $path) { $path }
+    }
+    $sessionManager = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    if (Test-Path -LiteralPath $sessionManager) {
+        $pending = Get-Value (Get-ItemProperty -LiteralPath $sessionManager) 'PendingFileRenameOperations'
+        if ($null -ne $pending -and @($pending).Count) { 'PendingFileRenameOperations (may be unrelated to this deployment)' }
+    }
+}
+
+function Write-DeploymentReport($Report, [string]$Directory) {
+    $jsonPath = Join-Path $Directory 'report.json'
+    $Report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+    $encode = { param($value) [Net.WebUtility]::HtmlEncode([string]$value) }
+    $rows = @($Report.Checks | ForEach-Object { '<tr><td>' + (& $encode $_.Name) + '</td><td>' + (& $encode $_.Pass) + '</td><td><pre>' + (& $encode ($_.Detail | ConvertTo-Json -Depth 15)) + '</pre></td></tr>' }) -join "`n"
+    $html = '<!doctype html><html lang="en"><meta charset="utf-8"><title>TinnosDebloat-Win11 deployment</title><style>body{font:15px system-ui;margin:2rem}td,th{border:1px solid #ccc;padding:.5rem;vertical-align:top}table{border-collapse:collapse}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style><h1>TinnosDebloat-Win11 deployment: ' + (& $encode $Report.Status) + '</h1><p>' + (& $encode $Report.FinishedUTC) + '</p><h2>Errors and pending actions</h2><pre>' + (& $encode (($Report.Errors + $Report.Pending) -join "`n")) + '</pre><h2>Validation</h2><table><tr><th>Check</th><th>Pass</th><th>Evidence</th></tr>' + $rows + '</table><h2>Full report</h2><pre>' + (& $encode ($Report | ConvertTo-Json -Depth 25)) + '</pre></html>'
+    $html | Set-Content -LiteralPath (Join-Path $Directory 'report.html') -Encoding UTF8
+    return $jsonPath
+}
+
+function Invoke-DeploymentSteps($Config, $Office, $Teams, $Policies, [string]$XmlPath, [string]$Directory) {
+    $script:Report.Steps += 'Create or verify a Windows restore point before deployment changes'
+    $script:Report.RestorePoint = New-DeploymentRestorePoint
+    $script:Report.Steps += '2 Remove Teams applications and machine-wide installers'
+    Remove-TeamsApplications $Teams $Config $Directory
+    $script:Report.Steps += '3 Remove Teams provisioned packages'
+    Remove-TeamsProvisioning $Teams
+    $script:Report.Steps += '4 Configure supported Teams prevention policy'
+    Set-TeamsPrevention $Policies
+    # User-context tasks may finish after this process. Never install Office ahead
+    # of unresolved per-profile removal, even with Teams excluded in the XML.
+    Assert-TeamsRemovalComplete
+    $script:Report.Steps += '5 Download/install Microsoft 365 Apps with ODT and Teams excluded'
+    Install-Office $Config $Office $Policies $XmlPath $Directory
+    $script:Report.Steps += '6 Install Google Chrome'
+    Install-GoogleChrome $Directory
+    $script:Report.Steps += '7 Install Google Drive for desktop'
+    Install-GoogleDrive $Directory
+    $script:Report.Steps += '8 Configure Chrome defaults with supported Windows mechanisms'
+    Set-ChromeDefault $Directory $Policies
+}
+
+function Convert-RestorePointTime($Point) {
+    if ($Point.CreationTime -is [datetime]) { return $Point.CreationTime.ToUniversalTime() }
+    return [Management.ManagementDateTimeConverter]::ToDateTime([string]$Point.CreationTime).ToUniversalTime()
+}
+
+function New-DeploymentRestorePoint {
+    try {
+        $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore'
+        if (Test-Path -LiteralPath $policy) {
+            $settings = Get-ItemProperty -LiteralPath $policy
+            if ((Get-Value $settings 'DisableSR' 0) -eq 1 -or (Get-Value $settings 'DisableConfig' 0) -eq 1) {
+                throw 'System Restore is disabled by organization policy. Resolve it centrally before deployment.'
+            }
+        }
+        $description = 'TinnosDebloat-Win11 ' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ') + ' ' + [guid]::NewGuid().ToString('N').Substring(0,8)
+        Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop
+        $checkpointError = $null
+        try { Checkpoint-Computer -Description $description -RestorePointType MODIFY_SETTINGS -ErrorAction Stop -WarningAction Stop }
+        catch { $checkpointError = [string]$_ }
+        $points = @(Get-ComputerRestorePoint -ErrorAction Stop | Sort-Object SequenceNumber -Descending)
+        $created = @($points | Where-Object { $_.Description -eq $description })
+        if ($created.Count) {
+            return [pscustomobject]@{ Status='Created'; SequenceNumber=$created[0].SequenceNumber; Description=$description; CreatedUTC=(Convert-RestorePointTime $created[0]).ToString('o') }
+        }
+        # Windows normally limits Checkpoint-Computer to one restore point per day.
+        # Accept an existing recent point only when Windows explicitly throttled creation.
+        if ($checkpointError -match '24|frequency|frequ.ncia|already.*created|j.*criado' -and $points.Count) {
+            $time = Convert-RestorePointTime $points[0]
+            $age = (Get-Date).ToUniversalTime() - $time
+            if ($age.TotalHours -ge 0 -and $age.TotalHours -lt 24) {
+                return [pscustomobject]@{ Status='ReusedRecent'; SequenceNumber=$points[0].SequenceNumber; Description=$points[0].Description; CreatedUTC=$time.ToString('o'); Reason=$checkpointError }
+            }
+        }
+        throw "A restore point could not be verified. $checkpointError"
+    } catch {
+        $exception = New-Object InvalidOperationException("Restore point unavailable. Deployment stopped before application removal or installation. $($_.Exception.Message)")
+        $exception.Data['PendingAction'] = $true
+        throw $exception
+    }
+}
+
+function Invoke-CorporateProvisioning([string]$ConfigPath, [ValidateSet('Audit','Plan','Deploy')][string]$Mode, [string]$OutputDirectory) {
+    if (![Environment]::Is64BitProcess) { throw 'Run 64-bit Windows PowerShell 5.1, including from 32-bit management agents via Sysnative.' }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if (!(New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator privileges are required to audit every profile and provisioned package.' }
+    $config = Read-DeploymentConfig $ConfigPath
+    $mutex = New-Object Threading.Mutex($false, 'Global\TinnosDebloat-Win11CorporateProvisioning')
+    $locked = $false
+    try {
+        try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
+        if (!$locked) { throw 'Another TinnosDebloat-Win11 provisioning run is active.' }
+        Initialize-ProtectedDirectory $OutputDirectory
+        $directory = Join-Path $OutputDirectory ((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+        Initialize-ProtectedDirectory $directory
+        $script:Report = [pscustomobject]@{ Mode=$Mode; Status='Running'; Computer=$env:COMPUTERNAME; StartedUTC=(Get-Date).ToUniversalTime().ToString('o'); FinishedUTC=$null
+            Configuration=$config; Steps=@(); Operations=@(); Downloads=@(); PreservedData=@(); UserCleanup=@(); Errors=@(); Pending=@(); Notes=@(); Checks=@(); RestorePoint=$null; RebootRequired=$false; RebootReasons=@(); Before=$null; After=$null; Activation=$null }
+        try {
+            $script:Report.Steps += '1 Detect existing Office and Teams'
+            $office = Get-OfficeState $config; $teams = Get-TeamsInventory; $policies = Get-PolicyEvidence
+            $script:Report.Before = [pscustomobject]@{ Office=$office; Teams=$teams; Policies=$policies }
+            $xmlPath = Join-Path $directory 'office-configuration.xml'
+            $null = New-OfficeConfiguration $config $office $xmlPath
+            if ($Mode -eq 'Deploy') {
+                Invoke-DeploymentSteps $config $office $teams $policies $xmlPath $directory
+            }
+        } catch {
+            if ($_.Exception.Data.Contains('PendingAction')) { $script:Report.Pending += [string]$_ }
+            else { $script:Report.Errors += [string]$_ }
+        }
+        # Validate even after an installer/policy error. Empty/failed enumeration never proves absence.
+        $script:Report.Steps += '9 Validate applications, Teams absence, policies and activation'
+        try {
+            $office = Get-OfficeState $config; $teams = Get-TeamsInventory; $policies = Get-PolicyEvidence; $google = Get-GoogleApps
+            Get-UserCleanupResults $teams -RemoveCompleted:($Mode -eq 'Deploy')
+            $script:Report.RebootReasons = @(Get-PendingRebootReasons)
+            if ($script:Report.RebootReasons.Count) { $script:Report.RebootRequired = $true }
+            $script:Report.After = [pscustomobject]@{ Office=$office; Teams=$teams; Policies=$policies; Google=$google }
+            $script:Report.Checks = @(Get-DeploymentChecks $config $office $teams $policies $google $directory)
+            $script:Report.Errors += @($teams.Errors) + @($policies.Errors) + @($policies.Conflicts)
+            $script:Report.Activation = Get-OfficeActivation $config.ProductId
+            if ($script:Report.Activation.Status -ne 'Licensed') { $script:Report.Notes += 'Employee license/activation is unverified or pending. Run Check-OfficeActivation.ps1 as the employee after licensed account sign-in.' }
+            $script:Report.Status = Get-DeploymentStatus $script:Report.Checks $script:Report.Errors $script:Report.RebootRequired $script:Report.Pending
+            if ($Mode -eq 'Plan' -and !$script:Report.Errors.Count) { $script:Report.Status = 'Planned' }
+        } catch { $script:Report.Errors += "Validation: $_"; $script:Report.Status = 'Failed' }
+        $script:Report.FinishedUTC = (Get-Date).ToUniversalTime().ToString('o')
+        $script:Report.Steps += '10 Generate detailed deployment report'
+        $path = Write-DeploymentReport $script:Report $directory
+        [pscustomobject]@{ Status=$script:Report.Status; ReportPath=$path }
+    } finally { if ($locked) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
+}
+
+Export-ModuleMember -Function *
