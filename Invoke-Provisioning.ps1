@@ -6,6 +6,11 @@ param(
     [string]$OutputDirectory = "$env:ProgramData\TinnosDebloat-Win11\Deployment"
 )
 $ErrorActionPreference = 'Stop'
+# Keep diagnostic language independent of Windows and the PT-BR Office payload.
+[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('en-US')
+[Threading.Thread]::CurrentThread.CurrentUICulture = [Globalization.CultureInfo]::GetCultureInfo('en-US')
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
 try {
     Import-Module "$PSScriptRoot\Provisioning.psm1" -Force
     $result = Invoke-CorporateProvisioning -ConfigPath $ConfigPath -Mode $Mode -OutputDirectory $OutputDirectory

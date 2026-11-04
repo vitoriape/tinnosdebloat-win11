@@ -375,6 +375,31 @@ try {
             Assert ($process.ExitCode -eq 0 -and $stdout.Trim() -eq 'safe-launch') ("Fixture launch failed: "+$stderr)
         } finally {$process.Dispose()}
     }
+    Test 'Worker logs use English culture and UTF-8 on both redirected streams' {
+        $fixture=Join-Path $work 'Invoke-Provisioning.ps1'
+        $moduleLiteral=$modulePath.Replace("'","''")
+        $body=@'
+param($ConfigPath,$Mode,$OutputDirectory)
+[Threading.Thread]::CurrentThread.CurrentCulture = 'pt-BR'
+[Threading.Thread]::CurrentThread.CurrentUICulture = 'pt-BR'
+Import-Module '__MODULE__' -Force -DisableNameChecking
+$sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
+[Console]::WriteLine([Globalization.CultureInfo]::CurrentCulture.Name)
+[Console]::Error.WriteLine([Globalization.CultureInfo]::CurrentUICulture.Name)
+[Console]::WriteLine($sample)
+[Console]::Error.WriteLine($sample)
+'@
+        [IO.File]::WriteAllText($fixture,$body.Replace('__MODULE__',$moduleLiteral))
+        $command=[TinnosDebloat.Payload]::Command($work,(Join-Path $work 'config.json'),'Audit',(Join-Path $work 'work'))
+        Assert ($command.StandardOutputEncoding.WebName -eq 'utf-8' -and $command.StandardErrorEncoding.WebName -eq 'utf-8') 'Output decoder mismatch.'
+        $process=New-Object Diagnostics.Process; $process.StartInfo=$command
+        try {
+            $null=$process.Start(); $stdout=$process.StandardOutput.ReadToEnd(); $stderr=$process.StandardError.ReadToEnd(); $process.WaitForExit()
+            $expected='en-US'+[Environment]::NewLine+'Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
+            Assert ($process.ExitCode -eq 0 -and $stdout.Trim() -eq $expected -and $stderr.Trim() -eq $expected) ('Language or UTF-8 roundtrip failed: '+$stdout+$stderr)
+        } finally {$process.Dispose()}
+        Assert ($config.Languages.Count -eq 1 -and $config.Languages[0] -eq 'pt-br') 'Diagnostic culture changed Office language.'
+    }
     Test 'Interface has only Start and Details actions with fixed Office language' {
         Add-Type -AssemblyName System.Windows.Forms
         $form=$assembly.GetType('TinnosDebloat.Ui').GetMethod('Create').Invoke($null,@())

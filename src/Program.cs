@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Globalization;
 using System.Reflection;
 using System.Security.AccessControl;
 using System.Security.Principal;
@@ -68,7 +69,8 @@ namespace TinnosDebloat
                 Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + Quote(Path.Combine(directory, "Invoke-Provisioning.ps1"))
                     + " -ConfigPath " + Quote(Path.GetFullPath(config)) + " -Mode " + mode + " -OutputDirectory " + Quote(Path.GetFullPath(output)),
                 WorkingDirectory = directory, UseShellExecute = false, CreateNoWindow = true,
-                RedirectStandardOutput = true, RedirectStandardError = true
+                RedirectStandardOutput = true, RedirectStandardError = true,
+                StandardOutputEncoding = new UTF8Encoding(false), StandardErrorEncoding = new UTF8Encoding(false)
             };
         }
     }
@@ -78,6 +80,10 @@ namespace TinnosDebloat
         [STAThread]
         private static int Main(string[] args)
         {
+            CultureInfo english = CultureInfo.GetCultureInfo("en-US");
+            CultureInfo.DefaultThreadCurrentCulture = english; CultureInfo.DefaultThreadCurrentUICulture = english;
+            Thread.CurrentThread.CurrentCulture = english; Thread.CurrentThread.CurrentUICulture = english;
+            Console.OutputEncoding = new UTF8Encoding(false);
             if (args.Length > 0) return CommandLine(args);
             Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(Ui.Create()); return 0;

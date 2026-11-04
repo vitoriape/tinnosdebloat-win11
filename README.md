@@ -308,6 +308,11 @@ repository for review and rebuilding.
 - **Log:** live execution output and additional notes.
 
 Results and the live log stay in memory and are lost when the application closes.
+Application diagnostics and PowerShell use English (`en-US`), independently of
+Office's fixed PT-BR language. The launcher reads both output streams as UTF-8
+to preserve accented paths and user names. Windows/vendor components can still
+return messages in their installed language; those original diagnostics are
+preserved alongside the English error title and recovery action.
 The tool does not write `report.html`, `report.json` or `launcher.log`.
 For troubleshooting, use the [error-code reference](docs/ERROR_CODES.md).
 For example, `TNO-300` identifies DNS resolution failure and `TNO-400` identifies

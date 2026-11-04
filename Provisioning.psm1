@@ -1,6 +1,11 @@
 #Requires -Version 5.1
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+# Also applies to direct module use and the per-user cleanup/activation helpers.
+[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('en-US')
+[Threading.Thread]::CurrentThread.CurrentUICulture = [Globalization.CultureInfo]::GetCultureInfo('en-US')
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
 $script:ModuleRoot = $PSScriptRoot
 $script:OfficePolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Office\16.0\common\officeupdate'
 $script:BrowserPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
