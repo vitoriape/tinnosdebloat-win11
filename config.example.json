@@ -1,8 +1,9 @@
 {
   "LicenseEdition": "Business",
   "Architecture": "64",
-  "Languages": ["pt-br", "en-us"],
+  "Languages": ["pt-br"],
   "Channel": "Current",
+  "AppMode": "Download",
   "IncludeAccess": false,
   "ExcludeOneDrive": true,
   "ExcludeNewOutlook": true

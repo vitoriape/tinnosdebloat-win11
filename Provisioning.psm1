@@ -7,6 +7,48 @@ $script:BrowserPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
 $script:TeamNames = @('MSTeams', 'MicrosoftTeams')
 $script:RequiredApps = [ordered]@{ Word='WINWORD.EXE'; Excel='EXCEL.EXE'; PowerPoint='POWERPNT.EXE'; Outlook='OUTLOOK.EXE'; OneNote='ONENOTE.EXE' }
 $script:Report = $null
+$script:ErrorCatalog = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'error-codes.json')) | ConvertFrom-Json
+
+function New-TinnosError([string]$Code, [string]$Message, $NativeCode = $null) {
+    $exception = New-Object InvalidOperationException($Message)
+    $exception.Data['TinnosCode'] = $Code
+    if ($null -ne $NativeCode) { $exception.Data['NativeCode'] = $NativeCode }
+    return $exception
+}
+
+function Get-TinnosErrorCode($ErrorRecord, [string]$Default = 'TNO-900') {
+    $exception = if ($ErrorRecord -is [Exception]) { $ErrorRecord } else { $ErrorRecord.Exception }
+    while ($null -ne $exception) {
+        if ($exception.Data.Contains('TinnosCode')) { return [string]$exception.Data['TinnosCode'] }
+        if ($exception -is [Net.WebException]) {
+            if ($exception.Status -in @([Net.WebExceptionStatus]::NameResolutionFailure,[Net.WebExceptionStatus]::ProxyNameResolutionFailure)) { return 'TNO-300' }
+            if ($exception.Status -eq [Net.WebExceptionStatus]::Timeout) { return 'TNO-302' }
+            return 'TNO-301'
+        }
+        if ($exception -is [UnauthorizedAccessException] -or $exception -is [IO.IOException]) { return 'TNO-104' }
+        $exception = $exception.InnerException
+    }
+    return $Default
+}
+
+function New-DeploymentIssue([string]$Code, [string]$Message, [string]$Stage, [string]$Severity = 'Error', $ErrorRecord = $null) {
+    if ($null -ne $ErrorRecord) { $Code = Get-TinnosErrorCode $ErrorRecord $Code }
+    $entry = $script:ErrorCatalog.PSObject.Properties[$Code]
+    if ($null -eq $entry) { $Code = 'TNO-900'; $entry = $script:ErrorCatalog.PSObject.Properties[$Code] }
+    $native = $null
+    if ($null -ne $ErrorRecord) {
+        $exception = $ErrorRecord.Exception
+        while ($null -ne $exception) {
+            if ($exception.Data.Contains('NativeCode')) { $native = $exception.Data['NativeCode']; break }
+            $exception = $exception.InnerException
+        }
+    }
+    [pscustomobject]@{ Code=$Code; Title=$entry.Value.Title; Message=$Message; Action=$entry.Value.Action; Stage=$Stage; Severity=$Severity; NativeCode=$native }
+}
+
+function Add-RunIssue($Issue) {
+    if ($null -ne $script:Report -and $null -ne $script:Report.PSObject.Properties['Issues']) { $script:Report.Issues += $Issue }
+}
 
 function Get-Value($Object, [string]$Name, $Default = $null) {
     if ($null -ne $Object -and $null -ne $Object.PSObject.Properties[$Name]) { return $Object.$Name }
@@ -22,8 +64,8 @@ function Get-OfficeProductId([string]$LicenseEdition) {
 
 function Read-DeploymentConfig([string]$Path) {
     $inputConfig = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
-    if ($null -eq $inputConfig -or $inputConfig -isnot [pscustomobject]) { throw 'Configuration must be a JSON object.' }
-    $allowed = @('LicenseEdition','Architecture','Languages','Channel','IncludeAccess','ExcludeOneDrive','ExcludeNewOutlook')
+    if ($null -eq $inputConfig -or $inputConfig -isnot [pscustomobject]) { throw (New-TinnosError 'TNO-100' 'Configuration must be a JSON object.') }
+    $allowed = @('LicenseEdition','Architecture','Languages','Channel','IncludeAccess','ExcludeOneDrive','ExcludeNewOutlook','AppMode')
     foreach ($property in $inputConfig.PSObject.Properties) {
         $key = $property.Name
         if ($key -notin $allowed) { throw "Unknown configuration field: $key" }
@@ -32,9 +74,11 @@ function Read-DeploymentConfig([string]$Path) {
     $null = Get-OfficeProductId $edition
     $architecture = Get-Value $inputConfig 'Architecture' '64'
     if ($architecture -notin @('32','64')) { throw 'Architecture must be 32 or 64.' }
-    $languages = @(Get-Value $inputConfig 'Languages' @('pt-br','en-us'))
-    if (!$languages.Count -or @($languages | Where-Object { $_ -notin @('pt-br','en-us') }).Count) { throw 'Languages must contain pt-br and/or en-us.' }
+    $languages = @(Get-Value $inputConfig 'Languages' @('pt-br'))
+    if ($languages.Count -ne 1 -or $languages[0] -ne 'pt-br') { throw (New-TinnosError 'TNO-100' 'Office language is fixed to pt-br. Remove other languages from the configuration.') }
     $channel = Get-Value $inputConfig 'Channel' 'Current'
+    $appMode = Get-Value $inputConfig 'AppMode' 'Download'
+    if ($appMode -notin @('Download','Install')) { throw 'AppMode must be Download or Install.' }
     if ($channel -notin @('Current','MonthlyEnterprise','SemiAnnual','SemiAnnualPreview','CurrentPreview','BetaChannel')) { throw 'Unsupported Office channel.' }
     foreach ($name in @('IncludeAccess','ExcludeOneDrive','ExcludeNewOutlook')) {
         if ($null -ne $inputConfig.PSObject.Properties[$name] -and $inputConfig.$name -isnot [bool]) { throw "$name must be a JSON boolean." }
@@ -42,6 +86,7 @@ function Read-DeploymentConfig([string]$Path) {
     [pscustomobject]@{
         LicenseEdition=$edition; ProductId=(Get-OfficeProductId $edition); Architecture=[string]$architecture
         Languages=@($languages | Select-Object -Unique); Channel=$channel
+        AppMode=$appMode
         IncludeAccess=(Get-Value $inputConfig 'IncludeAccess' $false)
         ExcludeOneDrive=(Get-Value $inputConfig 'ExcludeOneDrive' $true)
         ExcludeNewOutlook=(Get-Value $inputConfig 'ExcludeNewOutlook' $true)
@@ -65,8 +110,9 @@ function New-OfficeConfiguration($Config, $Office, [string]$Path) {
     $add = $xml.CreateElement('Add'); $null = $root.AppendChild($add)
     $add.SetAttribute('OfficeClientEdition', $Config.Architecture)
     $add.SetAttribute('Channel', $Config.Channel)
+    $add.SetAttribute('SourcePath', (Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))) 'OfficeMedia'))
     $product = $xml.CreateElement('Product'); $product.SetAttribute('ID', $Config.ProductId); $null = $add.AppendChild($product)
-    $languages = @($Config.Languages) + @(Get-Value $Office 'Languages' @())
+    $languages = @('pt-br')
     foreach ($language in @($languages | Where-Object { $_ } | Select-Object -Unique)) {
         $node = $xml.CreateElement('Language'); $node.SetAttribute('ID', $language); $null = $product.AppendChild($node)
     }
@@ -192,7 +238,7 @@ function Get-TeamsStartup([string]$Hive) {
 
 function Disable-TeamsStartup($Entry) {
     if (Get-Value $Entry 'PackagedStartup' $false) {
-        if ([int]$Entry.Value -eq 4) { throw 'Teams startup is enabled by central policy; resolve the policy instead of overriding it.' }
+        if ([int]$Entry.Value -eq 4) { throw (New-TinnosError 'TNO-202' 'Teams startup is enabled by central policy; resolve the policy instead of overriding it.') }
         # The supported startup task State=1 disables user autostart; never change shared app state.
         $null = New-ItemProperty -LiteralPath $Entry.Path -Name State -PropertyType DWord -Value 1 -Force
     } else { Remove-ItemProperty -LiteralPath $Entry.Path -Name $Entry.Name }
@@ -297,7 +343,7 @@ function Test-TeamsAbsent($Inventory) {
 
 function Invoke-Installer([string]$FilePath, [string]$Arguments, [int[]]$SuccessCodes = @(0,3010,1641)) {
     $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WindowStyle Hidden -Wait -PassThru
-    if ($process.ExitCode -notin $SuccessCodes) { throw "$([IO.Path]::GetFileName($FilePath)) failed with exit code $($process.ExitCode)." }
+    if ($process.ExitCode -notin $SuccessCodes) { throw (New-TinnosError 'TNO-400' "$([IO.Path]::GetFileName($FilePath)) failed with exit code $($process.ExitCode)." $process.ExitCode) }
     if ($null -ne $script:Report -and $process.ExitCode -in @(3010,1641)) { $script:Report.RebootRequired = $true }
     if ($null -ne $script:Report) { $script:Report.Operations += [pscustomobject]@{ Executable=[IO.Path]::GetFileName($FilePath); Arguments=$Arguments; ExitCode=$process.ExitCode } }
     return $process.ExitCode
@@ -306,41 +352,78 @@ function Invoke-Installer([string]$FilePath, [string]$Arguments, [int[]]$Success
 function Assert-Publisher([string]$Path, [ValidateSet('Microsoft','Google')][string]$Publisher) {
     $signature = Get-AuthenticodeSignature -LiteralPath $Path
     if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch "O=$Publisher (Corporation|LLC|Inc\.)[, ]") {
-        throw "Invalid $Publisher Authenticode signature: $Path"
+        throw (New-TinnosError 'TNO-303' "Invalid $Publisher Authenticode signature: $Path")
     }
 }
 
 function Get-TrustedDownload([string]$Url, [string]$Path, [string]$Publisher) {
     $uri = [uri]$Url
     $allowedHost = if ($Publisher -eq 'Microsoft') { '(^|\.)microsoft\.com$' } else { '^dl\.google\.com$' }
-    if ($uri.Scheme -ne 'https' -or $uri.Host -notmatch $allowedHost) { throw "Unexpected download origin: $Url" }
+    if ($uri.Scheme -ne 'https' -or $uri.Host -notmatch $allowedHost) { throw (New-TinnosError 'TNO-305' "Unexpected download origin: $Url") }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $uri -OutFile $Path -UseBasicParsing
-    Assert-Publisher $Path $Publisher
-    $script:Report.Downloads += [pscustomobject]@{ Url=$Url; File=$Path; SHA256=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash; Publisher=$Publisher }
-    return $Path
+    $absolutePath = [IO.Path]::GetFullPath($Path)
+    $partial = Join-Path ([IO.Path]::GetDirectoryName($absolutePath)) ([IO.Path]::GetFileNameWithoutExtension($absolutePath) + '.download-' + [guid]::NewGuid().ToString('N') + [IO.Path]::GetExtension($absolutePath))
+    $failures = @(); $failureCodes = @(); $downloaded = $false; $methodUsed = ''
+    try {
+        foreach ($method in @('PowerShell','curl')) {
+            try {
+                if ($method -eq 'PowerShell') {
+                    Invoke-WebRequest -Uri $uri -OutFile $partial -UseBasicParsing -TimeoutSec 60
+                } else {
+                    Invoke-CurlTransfer $Url $partial
+                }
+                if (!(Test-Path -LiteralPath $partial) -or (Get-Item -LiteralPath $partial).Length -eq 0) { throw (New-TinnosError 'TNO-304' 'The downloaded file is empty.') }
+                $downloaded = $true; $methodUsed = $method; break
+            } catch {
+                $failures += "$method`: $($_.Exception.Message)"
+                $failureCodes += Get-TinnosErrorCode $_ 'TNO-301'
+                Write-Host "Download attempt failed ($method): $Url"
+                if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force }
+            }
+        }
+        if (!$downloaded) {
+            $code = if ('TNO-300' -in $failureCodes) {'TNO-300'} elseif ('TNO-302' -in $failureCodes) {'TNO-302'} elseif ('TNO-304' -in $failureCodes) {'TNO-304'} else {'TNO-301'}
+            throw (New-TinnosError $code ("Download failed for $Url. " + ($failures -join '; ')))
+        }
+        # Never accept a successful HTTP response without a valid vendor signature.
+        Assert-Publisher $partial $Publisher
+        Move-Item -LiteralPath $partial -Destination $absolutePath -Force
+        if ($null -ne $script:Report) {
+            $script:Report.Downloads += [pscustomobject]@{ Url=$Url; File=$absolutePath; Bytes=(Get-Item -LiteralPath $absolutePath).Length
+                SHA256=(Get-FileHash -LiteralPath $absolutePath -Algorithm SHA256).Hash; Publisher=$Publisher; Method=$methodUsed; EarlierFailures=$failures }
+        }
+        return $absolutePath
+    } finally { if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force } }
+}
+
+function Invoke-CurlTransfer([string]$Url, [string]$Destination) {
+    # Use Windows' protected inbox executable, never an executable found on a user PATH.
+    $curl = Join-Path $env:WINDIR 'System32\curl.exe'
+    if (!(Test-Path -LiteralPath $curl)) { throw (New-TinnosError 'TNO-301' 'Windows curl.exe is unavailable.') }
+    $curlError = @(& $curl --location --fail --silent --show-error --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 120 --output $Destination $Url 2>&1) -join ' '
+    if ($LASTEXITCODE -ne 0) {
+        $code = if ($LASTEXITCODE -in @(5,6)) {'TNO-300'} elseif ($LASTEXITCODE -eq 28) {'TNO-302'} else {'TNO-301'}
+        throw (New-TinnosError $code "curl exit $LASTEXITCODE`: $curlError" $LASTEXITCODE)
+    }
 }
 
 function Remove-TeamsMsi($Entry, [string]$LogDirectory) {
     if (!(Test-TeamsEntry $Entry)) { throw 'Refusing to uninstall an unrelated product.' }
-    if ($Entry.Key -notmatch '^\{[0-9A-Fa-f-]{36}\}$' -or $Entry.WindowsInstaller -ne 1) { throw "Unsupported Teams uninstaller for $($Entry.Name); use its supported uninstaller in the correct user context." }
-    if ($Entry.Name -match 'Meeting Add-in' -and @(Get-Process OUTLOOK -ErrorAction SilentlyContinue).Count) { throw 'Close Outlook before removing the Teams Meeting Add-in; no application was force-closed.' }
-    $log = Join-Path $LogDirectory ("teams-{0}.log" -f $Entry.Key.Trim('{}'))
-    $null = Invoke-Installer "$env:WINDIR\System32\msiexec.exe" "/x $($Entry.Key) /qn /norestart /L*v `"$log`"" @(0,1605,1614,3010,1641)
+    if ($Entry.Key -notmatch '^\{[0-9A-Fa-f-]{36}\}$' -or $Entry.WindowsInstaller -ne 1) { throw (New-TinnosError 'TNO-205' "Unsupported Teams uninstaller for $($Entry.Name); use its supported uninstaller in the correct user context.") }
+    if ($Entry.Name -match 'Meeting Add-in' -and @(Get-Process OUTLOOK -ErrorAction SilentlyContinue).Count) { throw (New-TinnosError 'TNO-403' 'Close Outlook before removing the Teams Meeting Add-in; no application was force-closed.') }
+    $null = Invoke-Installer "$env:WINDIR\System32\msiexec.exe" "/x $($Entry.Key) /qn /norestart" @(0,1605,1614,3010,1641)
 }
 
 function Invoke-TeamsUserCleanup {
     $script:Report = [pscustomobject]@{ RebootRequired=$false; Operations=@() }
     $errors = New-Object 'System.Collections.Generic.List[string]'
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $logDir = Join-Path $env:LOCALAPPDATA 'TinnosDebloat-Win11\DeploymentLogs'
-    $null = New-Item -Path $logDir -ItemType Directory -Force
     $updater = Join-Path $env:LOCALAPPDATA 'Microsoft\Teams\Update.exe'
     if (Test-Path -LiteralPath $updater) {
         try { Assert-Publisher $updater 'Microsoft'; $null = Invoke-Installer $updater '--uninstall -s' } catch { $errors.Add([string]$_) }
     }
     foreach ($entry in @(Get-UninstallEntries 'HKCU:' | Where-Object { Test-TeamsEntry $_ })) {
-        try { Remove-TeamsMsi $entry $logDir } catch { $errors.Add([string]$_) }
+        try { Remove-TeamsMsi $entry '' } catch { $errors.Add([string]$_) }
     }
     foreach ($entry in @(Get-TeamsStartup 'HKCU:')) {
         try { Disable-TeamsStartup $entry } catch { $errors.Add([string]$_) }
@@ -354,7 +437,7 @@ function Invoke-TeamsUserCleanup {
 function Initialize-ProtectedDirectory([string]$Path, [switch]$AdministratorsOnly) {
     $null = New-Item -Path $Path -ItemType Directory -Force
     $item = Get-Item -LiteralPath $Path
-    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing reparse-point deployment directory: $Path" }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw (New-TinnosError 'TNO-104' "Refusing reparse-point deployment directory: $Path") }
     # Protect scheduled task code, installers, configuration and reports from standard-user replacement.
     $acl = New-Object Security.AccessControl.DirectorySecurity
     $acl.SetAccessRuleProtection($true,$false)
@@ -371,9 +454,9 @@ function Initialize-ProtectedDirectory([string]$Path, [switch]$AdministratorsOnl
 function Backup-TeamsUserData($Inventory, [string]$Directory) {
     # Appx removal can remove application data; PreserveApplicationData does not work
     # for production Store packages. Preserve complete Teams stores before uninstall.
-    if (@($Inventory.Errors).Count) { throw 'All profiles must be inspectable before Teams data can be preserved. No Teams removal was started.' }
+    if (@($Inventory.Errors).Count) { throw (New-TinnosError 'TNO-200' 'All profiles must be inspectable before Teams data can be preserved. No Teams removal was started.') }
     if (Test-TeamsAbsent $Inventory) { return }
-    if (@(Get-Process Teams,ms-teams,msteams -ErrorAction SilentlyContinue).Count) { throw 'Close Teams in every active session before preserving data and removing it. No Teams process was force-closed.' }
+    if (@(Get-Process Teams,ms-teams,msteams -ErrorAction SilentlyContinue).Count) { throw (New-TinnosError 'TNO-403' 'Close Teams in every active session before preserving data and removing it. No Teams process was force-closed.') }
     $backupRoot = Join-Path $Directory 'PreservedTeamsData'
     Initialize-ProtectedDirectory $backupRoot -AdministratorsOnly
     foreach ($profile in $Inventory.Profiles) {
@@ -385,13 +468,12 @@ function Backup-TeamsUserData($Inventory, [string]$Directory) {
             $sourceItem = Get-Item -LiteralPath $source -Force
             $reparse = @($sourceItem) + @(Get-ChildItem -LiteralPath $source -Force -Recurse)
             if (@($reparse | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) {
-                throw "Teams data contains redirected/reparse paths: $source. Preserve its target through your backup process before retrying; no removal was started."
+                throw (New-TinnosError 'TNO-204' "Teams data contains redirected/reparse paths: $source. Preserve its target before retrying; no removal was started.")
             }
             $target = Join-Path (Join-Path $backupRoot $profile.SID) $relative
             $null = New-Item -Path $target -ItemType Directory -Force
-            $log = Join-Path $backupRoot 'copy.log'
-            $null = & "$env:WINDIR\System32\robocopy.exe" $source $target /E /COPY:DAT /DCOPY:DAT /XJ /R:0 /W:0 /NFL /NDL /NP "/LOG+:$log"
-            if ($LASTEXITCODE -ge 8) { throw "Teams data backup failed for $($profile.SID) (robocopy $LASTEXITCODE). Close Teams/sign out and rerun; no removal was started. Log: $log" }
+            $null = & "$env:WINDIR\System32\robocopy.exe" $source $target /E /COPY:DAT /DCOPY:DAT /XJ /R:0 /W:0 /NFL /NDL /NP
+            if ($LASTEXITCODE -ge 8) { throw (New-TinnosError 'TNO-204' "Teams data backup failed for $($profile.SID) (robocopy $LASTEXITCODE). Close Teams/sign out and rerun; no removal was started." $LASTEXITCODE) }
             $script:Report.PreservedData += [pscustomobject]@{ SID=$profile.SID; Source=$source; Backup=$target; CopyExitCode=$LASTEXITCODE }
         }
     }
@@ -403,16 +485,8 @@ function Get-UserCleanupResults($Inventory, [switch]$RemoveCompleted) {
         $sid = $task.TaskName -replace '^TinnosDebloat-Win11-RemoveTeams-', ''
         $profile = @($Inventory.Profiles | Where-Object { $_.SID -eq $sid })
         $info = Get-ScheduledTaskInfo -TaskName $task.TaskName
-        $result = $null
-        $match = [regex]::Match([string]$task.Actions[0].Arguments, '-ResultPath "([^"]+)"')
-        if ($match.Success -and (Test-Path -LiteralPath $match.Groups[1].Value)) {
-            try { $result = Get-Content -LiteralPath $match.Groups[1].Value -Raw | ConvertFrom-Json } catch { $script:Report.Notes += "Unreadable user result for $sid; independent inventory remains authoritative." }
-        }
-        if ($null -ne $result -and (Get-Value $result 'RebootRequired' $false)) {
-            $resultTime = Get-Value $result 'Time'
-            if (!$resultTime -or [datetime]::Parse($resultTime).ToUniversalTime() -gt $lastBoot) { $script:Report.RebootRequired = $true }
-        }
-        $script:Report.UserCleanup += [pscustomobject]@{ SID=$sid; TaskName=$task.TaskName; State=[string]$task.State; LastTaskResult=$info.LastTaskResult; LastRunTime=$info.LastRunTime; Result=$result }
+        if ($info.LastTaskResult -eq 3010 -and $info.LastRunTime.ToUniversalTime() -gt $lastBoot) { $script:Report.RebootRequired = $true }
+        $script:Report.UserCleanup += [pscustomobject]@{ SID=$sid; TaskName=$task.TaskName; State=[string]$task.State; LastTaskResult=$info.LastTaskResult; LastRunTime=$info.LastRunTime }
         $remaining = $true
         if ($profile.Count -eq 1) {
             $remaining = $false
@@ -422,7 +496,7 @@ function Get-UserCleanupResults($Inventory, [switch]$RemoveCompleted) {
             if ($RemoveCompleted) {
                 Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false
                 $script:Report.Pending = @($script:Report.Pending | Where-Object { $_ -notlike "User cleanup scheduled: $($task.TaskName).*" })
-                $script:Report.Notes += "Completed cleanup task removed: $($task.TaskName). Preserved user data and logs retained."
+                $script:Report.Notes += "Completed cleanup task removed: $($task.TaskName). Preserved user data retained."
             }
         } else { $script:Report.Pending += "Profile cleanup requires sign-in/retry: $($task.TaskName); task state $($task.State), last result $($info.LastTaskResult)." }
     }
@@ -431,22 +505,15 @@ function Get-UserCleanupResults($Inventory, [switch]$RemoveCompleted) {
 function Register-UserCleanup($Profile, [string]$Directory) {
     $code = Join-Path $Directory 'UserCleanup'
     Initialize-ProtectedDirectory $code
-    foreach ($file in @('Invoke-UserCleanup.ps1','Provisioning.psm1')) { Copy-Item -LiteralPath (Join-Path $script:ModuleRoot $file) -Destination $code -Force }
-    $resultDir = Join-Path $code $Profile.SID
-    Initialize-ProtectedDirectory $resultDir
-    $acl = Get-Acl -LiteralPath $resultDir
-    $identity = New-Object Security.Principal.SecurityIdentifier($Profile.SID)
-    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($identity,'Modify','ContainerInherit,ObjectInherit','None','Allow')))
-    Set-Acl -LiteralPath $resultDir -AclObject $acl
-    $resultFile = Join-Path $resultDir 'result.json'
+    foreach ($file in @('Invoke-UserCleanup.ps1','Provisioning.psm1','error-codes.json')) { Copy-Item -LiteralPath (Join-Path $script:ModuleRoot $file) -Destination $code -Force }
     $name = 'TinnosDebloat-Win11-RemoveTeams-' + $Profile.SID
-    $action = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$code\Invoke-UserCleanup.ps1`" -ResultPath `"$resultFile`""
+    $action = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$code\Invoke-UserCleanup.ps1`""
     $principal = New-ScheduledTaskPrincipal -UserId $Profile.SID -LogonType Interactive -RunLevel Limited
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $Profile.SID
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -MultipleInstances IgnoreNew
     $null = Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Trigger $trigger -Settings $settings -Force
     if ($Profile.Loaded) { try { Start-ScheduledTask -TaskName $name } catch { $script:Report.Pending += "Sign into profile $($Profile.SID) to complete cleanup: $_" } }
-    $script:Report.Pending += "User cleanup scheduled: $name. Sign in, close Outlook/Teams, then rerun Audit or Deploy. Result: $resultFile"
+    $script:Report.Pending += "User cleanup scheduled: $name. Sign in, close Outlook/Teams, then press Start again."
 }
 
 function Remove-TeamsApplications($Inventory, $Config, [string]$Directory) {
@@ -456,13 +523,13 @@ function Remove-TeamsApplications($Inventory, $Config, [string]$Directory) {
             $bootstrapper = Get-TrustedDownload 'https://go.microsoft.com/fwlink/?linkid=2243204&clcid=0x409' (Join-Path $Directory 'teamsbootstrapper.exe') 'Microsoft'
             # This is exclusively uninstall mode. Never pass -p or install a Teams MSIX.
             $null = Invoke-Installer $bootstrapper '-x -m'
-        } catch { $script:Report.Errors += "Teams bootstrapper: $_" }
+        } catch { $script:Report.Errors += "Teams bootstrapper: $_"; Add-RunIssue (New-DeploymentIssue 'TNO-203' ([string]$_) 'Teams bootstrapper' 'Error' $_) }
     }
     foreach ($entry in $Inventory.MachineEntries) {
-        try { Remove-TeamsMsi $entry $Directory } catch { $script:Report.Pending += "Machine component $($entry.Name): $_" }
+        try { Remove-TeamsMsi $entry $Directory } catch { $script:Report.Pending += "Machine component $($entry.Name): $_"; Add-RunIssue (New-DeploymentIssue 'TNO-203' ([string]$_) 'Teams MSI' 'Pending' $_) }
     }
     foreach ($package in $Inventory.Packages) {
-        try { Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop } catch { $script:Report.Pending += "Appx $($package.PackageFullName): $_" }
+        try { Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop } catch { $script:Report.Pending += "Appx $($package.PackageFullName): $_"; Add-RunIssue (New-DeploymentIssue 'TNO-203' ([string]$_) 'Teams Appx' 'Pending' $_) }
     }
     foreach ($profile in $Inventory.Profiles) {
         if (@($profile.Entries).Count -or @($profile.Binaries).Count -or @($profile.Startup).Count -or @($profile.Shortcuts).Count -or @($profile.AddinFiles).Count) {
@@ -475,9 +542,9 @@ function Remove-TeamsApplications($Inventory, $Config, [string]$Directory) {
 
 function Assert-TeamsRemovalComplete {
     $inventory = Get-TeamsInventory
-    if (@($inventory.Errors).Count) { throw ('Cannot verify Teams removal: ' + ($inventory.Errors -join '; ')) }
+    if (@($inventory.Errors).Count) { throw (New-TinnosError 'TNO-200' ('Cannot verify Teams removal: ' + ($inventory.Errors -join '; '))) }
     if (!(Test-TeamsAbsent $inventory)) {
-        $exception = New-Object InvalidOperationException('Teams removal is pending. Close Teams/Outlook, sign into affected profiles or reboot as reported, then rerun Deploy. Office, Chrome and Drive installation has not started.')
+        $exception = New-TinnosError 'TNO-203' 'Teams removal is pending. Close Teams/Outlook, sign into affected profiles or reboot, then press Start again. App installation has not started.'
         $exception.Data['PendingAction'] = $true
         throw $exception
     }
@@ -539,12 +606,12 @@ function Get-PolicyEvidence {
 }
 
 function Set-TeamsPrevention($Evidence) {
-    if (@($Evidence.Conflicts).Count -or @($Evidence.Errors).Count) { throw 'Teams policy conflict or unreadable central policy evidence; resolve centrally before Office installation.' }
+    if (@($Evidence.Conflicts).Count -or @($Evidence.Errors).Count) { throw (New-TinnosError 'TNO-202' 'Teams policy conflict or unreadable central policy evidence; resolve centrally before Office installation.') }
     if ($null -eq $Evidence.PreventTeamsInstall) {
         $null = New-Item -Path $script:OfficePolicy -Force
         $null = New-ItemProperty -LiteralPath $script:OfficePolicy -Name preventteamsinstall -PropertyType DWord -Value 1
     }
-    if ([int](Get-ItemProperty -LiteralPath $script:OfficePolicy).preventteamsinstall -ne 1) { throw 'Teams prevention policy verification failed.' }
+    if ([int](Get-ItemProperty -LiteralPath $script:OfficePolicy).preventteamsinstall -ne 1) { throw (New-TinnosError 'TNO-202' 'Teams prevention policy verification failed.') }
 }
 
 function Resolve-OfficialOdtUrl([string]$Content) {
@@ -556,8 +623,17 @@ function Resolve-OfficialOdtUrl([string]$Content) {
 
 function Get-OdtSetup($Config, [string]$Directory) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $page = Invoke-WebRequest -Uri 'https://www.microsoft.com/en-us/download/details.aspx?id=49117' -UseBasicParsing
-    $url = Resolve-OfficialOdtUrl $page.Content
+    try {
+        $page = Invoke-WebRequest -Uri 'https://www.microsoft.com/en-us/download/details.aspx?id=49117' -UseBasicParsing -TimeoutSec 20
+        $url = Resolve-OfficialOdtUrl $page.Content
+    } catch {
+        # Actual Download Center link verified 2026-11-04. Different Microsoft host
+        # avoids requiring www.microsoft.com DNS just to resolve the archive URL.
+        $url = 'https://download.microsoft.com/download/6c1eeb25-cf8b-41d9-8d0d-cc1dbc032140/officedeploymenttool_20430-20146.exe'
+        Write-Host 'Download Center unavailable; trying the verified official Microsoft ODT archive link.'
+        $script:Report.Notes += "ODT link discovery failed; official archive fallback selected. $($_.Exception.Message)"
+        Add-RunIssue (New-DeploymentIssue 'TNO-306' "ODT discovery unavailable; using the official archive fallback. $($_.Exception.Message)" 'ODT discovery' 'Warning')
+    }
     $archive = Get-TrustedDownload $url (Join-Path $Directory 'officedeploymenttool.exe') 'Microsoft'
     $extract = Join-Path $Directory 'ODT'
     $null = New-Item -Path $extract -ItemType Directory -Force
@@ -565,19 +641,37 @@ function Get-OdtSetup($Config, [string]$Directory) {
     $setup = Join-Path $extract 'setup.exe'
     Assert-Publisher $setup 'Microsoft'
     $info = (Get-Item -LiteralPath $setup).VersionInfo
-    if ($info.OriginalFilename -notmatch '^setup\.exe$' -or ($info.FileDescription -notmatch 'Office' -and $info.ProductName -notmatch 'Office')) { throw 'The supplied executable is not Office setup.exe.' }
+    if ($info.OriginalFilename -notmatch '^setup\.exe$' -or ($info.FileDescription -notmatch 'Office' -and $info.ProductName -notmatch 'Office')) { throw (New-TinnosError 'TNO-307' 'The supplied executable is not Office setup.exe.') }
     return $setup
 }
 
 function Install-Office($Config, $Office, $Policies, [string]$XmlPath, [string]$Directory) {
-    if (Test-OfficeMatches $Config $Office) { $script:Report.Notes += 'Office already matches requested applications, product, architecture, languages, channel and exclusions; ODT skipped.'; return }
-    if ($Office.Present -and ($Office.Platform -ne "x$($Config.Architecture)" -or $Config.ProductId -notin $Office.ProductIds)) { throw 'Existing Office architecture/license product differs. Plan an administrator-approved migration; automatic removal is disabled.' }
-    if (!$Office.Present -and @($Office.OtherOffice).Count) { throw 'Existing nonmatching Office installation detected. Resolve compatibility before deploying Microsoft 365.' }
-    if (@($Policies.UpdatePolicies).Count) { throw 'Office update settings are centrally configured. Align this configuration centrally before changing Office; existing update policies were preserved.' }
-    if (@(Get-Process WINWORD,EXCEL,POWERPNT,OUTLOOK,ONENOTE,MSACCESS -ErrorAction SilentlyContinue).Count) { throw 'Close Office applications and rerun; installation will not force-close documents.' }
+    if ($Config.AppMode -eq 'Download') { return Get-OfficeMedia $Config $XmlPath $Directory }
+    if (Test-OfficeMatches $Config $Office) { $script:Report.Notes += 'Office already matches requested applications, product, architecture, languages, channel and exclusions; ODT skipped.'; return [pscustomobject]@{Status='AlreadyInstalled'} }
+    if ($Office.Present -and ($Office.Platform -ne "x$($Config.Architecture)" -or $Config.ProductId -notin $Office.ProductIds)) { throw (New-TinnosError 'TNO-401' 'Existing Office architecture/license product differs. Plan a migration; automatic removal is disabled.') }
+    if (!$Office.Present -and @($Office.OtherOffice).Count) { throw (New-TinnosError 'TNO-401' 'Existing nonmatching Office installation detected. Resolve compatibility before deploying Microsoft 365.') }
+    if (@($Policies.UpdatePolicies).Count) { throw (New-TinnosError 'TNO-202' 'Office update settings are centrally configured. Align the configuration centrally before changing Office.') }
+    if (@(Get-Process WINWORD,EXCEL,POWERPNT,OUTLOOK,ONENOTE,MSACCESS -ErrorAction SilentlyContinue).Count) { throw (New-TinnosError 'TNO-403' 'Close Office applications and rerun; installation will not force-close documents.') }
+    $media = Get-OfficeMedia $Config $XmlPath $Directory
+    $null = Invoke-Installer $media.Setup "/configure `"$XmlPath`""
+    return [pscustomobject]@{Status='Installed';Artifact=$media.Artifact}
+}
+
+function Test-OfficeMedia([string]$SourcePath, [string]$Architecture) {
+    $data = Join-Path $SourcePath 'Office\Data'
+    $cab = Join-Path $data "v$Architecture.cab"
+    if (!(Test-Path -LiteralPath $cab) -or (Get-Item -LiteralPath $cab).Length -eq 0) { return $false }
+    return (@(Get-ChildItem -LiteralPath $data -File -Recurse -Filter '*.dat' | Where-Object {$_.Length -gt 0}).Count -gt 0)
+}
+
+function Get-OfficeMedia($Config, [string]$XmlPath, [string]$Directory) {
     $setup = Get-OdtSetup $Config $Directory
+    [xml]$xml = Get-Content -LiteralPath $XmlPath -Raw
+    $source = $xml.Configuration.Add.SourcePath
+    $null = New-Item -Path $source -ItemType Directory -Force
     $null = Invoke-Installer $setup "/download `"$XmlPath`"" @(0)
-    $null = Invoke-Installer $setup "/configure `"$XmlPath`""
+    if (!(Test-OfficeMedia $source $Config.Architecture)) { throw (New-TinnosError 'TNO-402' 'ODT did not produce verifiable Office installation media; incomplete download retained for retry.') }
+    return [pscustomobject]@{Status='Downloaded';Artifact=$source;Setup=$setup;Configuration=$XmlPath}
 }
 
 function Get-GoogleApps {
@@ -589,16 +683,20 @@ function Get-GoogleApps {
     [pscustomobject]@{ Chrome=@($chrome); Drive=@($drive) }
 }
 
-function Install-GoogleChrome([string]$Directory) {
-    if (@((Get-GoogleApps).Chrome).Count) { return }
+function Install-GoogleChrome([string]$Directory, [switch]$DownloadOnly) {
+    if (!$DownloadOnly -and @((Get-GoogleApps).Chrome).Count) { return [pscustomobject]@{Status='AlreadyInstalled'} }
     $msi = Get-TrustedDownload 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi' (Join-Path $Directory 'chrome.msi') 'Google'
-    $null = Invoke-Installer "$env:WINDIR\System32\msiexec.exe" "/i `"$msi`" /qn /norestart /L*v `"$Directory\chrome.log`""
+    if ($DownloadOnly) { return [pscustomobject]@{Status='Downloaded';Artifact=$msi} }
+    $null = Invoke-Installer "$env:WINDIR\System32\msiexec.exe" "/i `"$msi`" /qn /norestart"
+    return [pscustomobject]@{Status='Installed';Artifact=$msi}
 }
 
-function Install-GoogleDrive([string]$Directory) {
-    if (@((Get-GoogleApps).Drive).Count) { return }
+function Install-GoogleDrive([string]$Directory, [switch]$DownloadOnly) {
+    if (!$DownloadOnly -and @((Get-GoogleApps).Drive).Count) { return [pscustomobject]@{Status='AlreadyInstalled'} }
     $setup = Get-TrustedDownload 'https://dl.google.com/drive-file-stream/GoogleDriveSetup.exe' (Join-Path $Directory 'GoogleDriveSetup.exe') 'Google'
+    if ($DownloadOnly) { return [pscustomobject]@{Status='Downloaded';Artifact=$setup} }
     $null = Invoke-Installer $setup '--silent --desktop_shortcut --skip_launch_new'
+    return [pscustomobject]@{Status='Installed';Artifact=$setup}
 }
 
 function New-ChromeAssociations([string]$Path) {
@@ -616,12 +714,12 @@ function Set-ChromeDefault([string]$Directory, $Evidence) {
     $target = Join-Path $Directory 'chrome-associations.xml'
     New-ChromeAssociations $target
     $existing = if (Test-Path -LiteralPath $script:BrowserPolicy) { Get-Value (Get-ItemProperty -LiteralPath $script:BrowserPolicy) 'DefaultAssociationsConfiguration' } else { $null }
-    if (@($Evidence.Evidence | Where-Object { $_.Source -eq 'MDM' -and $_.Name -match 'DefaultAssociationsConfiguration' }).Count) { throw 'MDM controls default associations; deploy the generated Chrome associations through Intune. Existing policy preserved.' }
+    if (@($Evidence.Evidence | Where-Object { $_.Source -eq 'MDM' -and $_.Name -match 'DefaultAssociationsConfiguration' }).Count) { throw (New-TinnosError 'TNO-202' 'MDM controls default associations; deploy the generated Chrome associations through Intune. Existing policy preserved.') }
     if ($existing -and (Test-ChromeAssociationFile $existing)) {
         $script:Report.Notes += 'Existing default association policy already selects Chrome; its path and all unrelated mappings were preserved.'
         return
     }
-    if ($existing -and $existing -ne $target) { throw "Existing default association policy preserved: $existing. Merge Chrome mappings centrally." }
+    if ($existing -and $existing -ne $target) { throw (New-TinnosError 'TNO-202' "Existing default association policy preserved: $existing. Merge Chrome mappings centrally.") }
     $null = Invoke-Installer "$env:WINDIR\System32\dism.exe" "/Online /Import-DefaultAppAssociations:`"$target`"" @(0,3010)
     $null = New-Item -Path $script:BrowserPolicy -Force
     $null = New-ItemProperty -LiteralPath $script:BrowserPolicy -Name DefaultAssociationsConfiguration -Value $target -PropertyType String -Force
@@ -663,7 +761,7 @@ function Get-OfficeActivation([string]$ProductId) {
     } catch { [pscustomobject]@{ Status='Unknown'; ContextSID=$sid; Reason=[string]$_ } }
 }
 
-function Get-DeploymentChecks($Config, $Office, $Teams, $Policies, $Google, [string]$Directory) {
+function Get-DeploymentChecks($Config, $Office, $Teams, $Policies, $Google, [string]$Directory, [string]$Mode = 'Audit', $Applications = @()) {
     $checks = @()
     foreach ($app in $script:RequiredApps.Keys) { $checks += [pscustomobject]@{ Name=$app; Pass=(@(Get-Value $Office.Apps $app @()).Count -gt 0); Detail=@(Get-Value $Office.Apps $app @()) } }
     if ($Config.IncludeAccess) { $checks += [pscustomobject]@{ Name='Access'; Pass=(@($Office.Apps.Access).Count -gt 0); Detail=$Office.Apps.Access } }
@@ -687,17 +785,31 @@ function Get-DeploymentChecks($Config, $Office, $Teams, $Policies, $Google, [str
         }
     } catch { $browserValid = $false }
     $checks += [pscustomobject]@{ Name='ChromeDefaultPolicy'; Pass=$browserValid; Detail="Policy: $policyPath. Existing sessions require next sign-in; this check does not claim that every current UserChoice has changed." }
+    $appChecks = @('Word','Excel','PowerPoint','Outlook','OneNote','Access','Chrome','GoogleDrive','OfficeConfiguration','OfficeTeamsExcluded','ChromeDefaultPolicy')
+    foreach ($check in $checks) {
+        $isApp = $check.Name -in $appChecks
+        # Installed-app observations stay visible in a download-only report but are
+        # not claims that downloading an installer also installs its applications.
+        $required = !$isApp -or ($Mode -eq 'Audit' -and $Config.AppMode -eq 'Install')
+        $check | Add-Member -NotePropertyName Required -NotePropertyValue $required
+        $check | Add-Member -NotePropertyName Category -NotePropertyValue $(if ($isApp) {'Application'} else {'Cleanup'})
+    }
+    foreach ($app in $Applications) {
+        if ($app.Name -eq 'ChromeDefaults') { continue }
+        $checks += [pscustomobject]@{Name=($app.Name + $Config.AppMode); Pass=($app.Status -in @('Downloaded','Installed','AlreadyInstalled')); Required=$false; Category='Application'; Detail=$app}
+    }
     return $checks
 }
 
-function Get-DeploymentStatus($Checks, $Errors, [bool]$RebootRequired, $Pending) {
+function Get-DeploymentStatus($Checks, $Errors, [bool]$RebootRequired, $Pending, $AppIssues = @()) {
     if (@($Errors).Count) { return 'Failed' }
     if (!@($Checks).Count) { return 'Failed' }
-    if (@($Checks | Where-Object { !$_.Pass }).Count) {
+    if (@($Checks | Where-Object { !$_.Pass -and (Get-Value $_ 'Required' $true) }).Count) {
         if (@($Pending).Count -or $RebootRequired) { return 'Pending' }
         return 'Failed'
     }
     if ($RebootRequired -or @($Pending).Count) { return 'Pending' }
+    if (@($AppIssues).Count) { return 'CompletedWithIssues' }
     return 'Complete'
 }
 
@@ -713,16 +825,6 @@ function Get-PendingRebootReasons {
     }
 }
 
-function Write-DeploymentReport($Report, [string]$Directory) {
-    $jsonPath = Join-Path $Directory 'report.json'
-    $Report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
-    $encode = { param($value) [Net.WebUtility]::HtmlEncode([string]$value) }
-    $rows = @($Report.Checks | ForEach-Object { '<tr><td>' + (& $encode $_.Name) + '</td><td>' + (& $encode $_.Pass) + '</td><td><pre>' + (& $encode ($_.Detail | ConvertTo-Json -Depth 15)) + '</pre></td></tr>' }) -join "`n"
-    $html = '<!doctype html><html lang="en"><meta charset="utf-8"><title>TinnosDebloat-Win11 deployment</title><style>body{font:15px system-ui;margin:2rem}td,th{border:1px solid #ccc;padding:.5rem;vertical-align:top}table{border-collapse:collapse}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style><h1>TinnosDebloat-Win11 deployment: ' + (& $encode $Report.Status) + '</h1><p>' + (& $encode $Report.FinishedUTC) + '</p><h2>Errors and pending actions</h2><pre>' + (& $encode (($Report.Errors + $Report.Pending) -join "`n")) + '</pre><h2>Validation</h2><table><tr><th>Check</th><th>Pass</th><th>Evidence</th></tr>' + $rows + '</table><h2>Full report</h2><pre>' + (& $encode ($Report | ConvertTo-Json -Depth 25)) + '</pre></html>'
-    $html | Set-Content -LiteralPath (Join-Path $Directory 'report.html') -Encoding UTF8
-    return $jsonPath
-}
-
 function Invoke-DeploymentSteps($Config, $Office, $Teams, $Policies, [string]$XmlPath, [string]$Directory) {
     $script:Report.Steps += 'Create or verify a Windows restore point before deployment changes'
     $script:Report.RestorePoint = New-DeploymentRestorePoint
@@ -734,15 +836,34 @@ function Invoke-DeploymentSteps($Config, $Office, $Teams, $Policies, [string]$Xm
     Set-TeamsPrevention $Policies
     # User-context tasks may finish after this process. Never install Office ahead
     # of unresolved per-profile removal, even with Teams excluded in the XML.
-    Assert-TeamsRemovalComplete
-    $script:Report.Steps += '5 Download/install Microsoft 365 Apps with ODT and Teams excluded'
-    Install-Office $Config $Office $Policies $XmlPath $Directory
-    $script:Report.Steps += '6 Install Google Chrome'
-    Install-GoogleChrome $Directory
-    $script:Report.Steps += '7 Install Google Drive for desktop'
-    Install-GoogleDrive $Directory
-    $script:Report.Steps += '8 Configure Chrome defaults with supported Windows mechanisms'
-    Set-ChromeDefault $Directory $Policies
+    if ($Config.AppMode -eq 'Install') { Assert-TeamsRemovalComplete }
+    $script:Report.Steps += "5 $($Config.AppMode) Microsoft 365 Apps with ODT and Teams excluded"
+    Invoke-ApplicationStep 'Office' $Config.AppMode { Install-Office $Config $Office $Policies $XmlPath $Directory }
+    $script:Report.Steps += "6 $($Config.AppMode) Google Chrome"
+    Invoke-ApplicationStep 'Chrome' $Config.AppMode { Install-GoogleChrome $Directory -DownloadOnly:($Config.AppMode -eq 'Download') }
+    $script:Report.Steps += "7 $($Config.AppMode) Google Drive for desktop"
+    Invoke-ApplicationStep 'GoogleDrive' $Config.AppMode { Install-GoogleDrive $Directory -DownloadOnly:($Config.AppMode -eq 'Download') }
+    if ($Config.AppMode -eq 'Install' -and @((Get-GoogleApps).Chrome).Count) {
+        $script:Report.Steps += '8 Configure Chrome defaults with supported Windows mechanisms'
+        Invoke-ApplicationStep 'ChromeDefaults' 'Configure' { Set-ChromeDefault $Directory $Policies; [pscustomobject]@{Status='Configured'} }
+    } else { $script:Report.Notes += 'Browser defaults skipped: download-only mode or Chrome is not installed.' }
+}
+
+function Invoke-ApplicationStep([string]$Name, [string]$Action, [scriptblock]$Operation) {
+    Write-Host "$Action $Name..."
+    try {
+        $result = & $Operation
+        $status = Get-Value $result 'Status'
+        if ($status -notin @('Downloaded','Installed','AlreadyInstalled','Configured')) { throw (New-TinnosError 'TNO-405' 'The app operation returned no confirmed result.') }
+        $script:Report.Applications += [pscustomobject]@{Name=$Name;Action=$Action;Status=$status;Detail=$result;Error=$null}
+    } catch {
+        $message = "$Name $Action failed and was skipped: $($_.Exception.Message)"
+        $script:Report.AppIssues += $message
+        $issue = New-DeploymentIssue 'TNO-404' $_.Exception.Message $Name 'Error' $_
+        Add-RunIssue $issue
+        $script:Report.Applications += [pscustomobject]@{Name=$Name;Action=$Action;Status='Failed';Detail=$null;Error=$_.Exception.Message;ErrorCode=$issue.Code}
+        Write-Host "[$($issue.Code)] $message"
+    }
 }
 
 function Convert-RestorePointTime($Point) {
@@ -780,27 +901,31 @@ function New-DeploymentRestorePoint {
         }
         throw "A restore point could not be verified. $checkpointError"
     } catch {
-        $exception = New-Object InvalidOperationException("Restore point unavailable. Deployment stopped before application removal or installation. $($_.Exception.Message)")
+        $exception = New-TinnosError 'TNO-201' "Restore point unavailable. Deployment stopped before application removal or installation. $($_.Exception.Message)"
         $exception.Data['PendingAction'] = $true
         throw $exception
     }
 }
 
-function Invoke-CorporateProvisioning([string]$ConfigPath, [ValidateSet('Audit','Plan','Deploy')][string]$Mode, [string]$OutputDirectory) {
-    if (![Environment]::Is64BitProcess) { throw 'Run 64-bit Windows PowerShell 5.1, including from 32-bit management agents via Sysnative.' }
+function Assert-ProvisioningHost {
+    if (![Environment]::Is64BitProcess) { throw (New-TinnosError 'TNO-102' 'Run 64-bit Windows PowerShell 5.1, including from 32-bit management agents via Sysnative.') }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    if (!(New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator privileges are required to audit every profile and provisioned package.' }
+    if (!(New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw (New-TinnosError 'TNO-101' 'Administrator privileges are required to inspect every profile and provisioned package.') }
+}
+
+function Invoke-CorporateProvisioning([string]$ConfigPath, [ValidateSet('Audit','Plan','Deploy')][string]$Mode, [string]$OutputDirectory) {
+    Assert-ProvisioningHost
     $config = Read-DeploymentConfig $ConfigPath
     $mutex = New-Object Threading.Mutex($false, 'Global\TinnosDebloat-Win11CorporateProvisioning')
     $locked = $false
     try {
         try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
-        if (!$locked) { throw 'Another TinnosDebloat-Win11 provisioning run is active.' }
+        if (!$locked) { throw (New-TinnosError 'TNO-103' 'Another TinnosDebloat-Win11 provisioning run is active.') }
         Initialize-ProtectedDirectory $OutputDirectory
         $directory = Join-Path $OutputDirectory ((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8))
         Initialize-ProtectedDirectory $directory
         $script:Report = [pscustomobject]@{ Mode=$Mode; Status='Running'; Computer=$env:COMPUTERNAME; StartedUTC=(Get-Date).ToUniversalTime().ToString('o'); FinishedUTC=$null
-            Configuration=$config; Steps=@(); Operations=@(); Downloads=@(); PreservedData=@(); UserCleanup=@(); Errors=@(); Pending=@(); Notes=@(); Checks=@(); RestorePoint=$null; RebootRequired=$false; RebootReasons=@(); Before=$null; After=$null; Activation=$null }
+            Configuration=$config; Steps=@(); Operations=@(); Downloads=@(); Applications=@(); AppIssues=@(); Issues=@(); PreservedData=@(); UserCleanup=@(); Errors=@(); Pending=@(); Notes=@(); Checks=@(); RestorePoint=$null; RebootRequired=$false; RebootReasons=@(); Before=$null; After=$null; Activation=$null }
         try {
             $script:Report.Steps += '1 Detect existing Office and Teams'
             $office = Get-OfficeState $config; $teams = Get-TeamsInventory; $policies = Get-PolicyEvidence
@@ -813,26 +938,41 @@ function Invoke-CorporateProvisioning([string]$ConfigPath, [ValidateSet('Audit',
         } catch {
             if ($_.Exception.Data.Contains('PendingAction')) { $script:Report.Pending += [string]$_ }
             else { $script:Report.Errors += [string]$_ }
+            Add-RunIssue (New-DeploymentIssue 'TNO-900' $_.Exception.Message 'Deployment' $(if ($_.Exception.Data.Contains('PendingAction')) {'Pending'} else {'Error'}) $_)
         }
         # Validate even after an installer/policy error. Empty/failed enumeration never proves absence.
-        $script:Report.Steps += '9 Validate applications, Teams absence, policies and activation'
+        $script:Report.Steps += '9 Validate application results, Teams absence and policies; activation deferred'
         try {
             $office = Get-OfficeState $config; $teams = Get-TeamsInventory; $policies = Get-PolicyEvidence; $google = Get-GoogleApps
             Get-UserCleanupResults $teams -RemoveCompleted:($Mode -eq 'Deploy')
             $script:Report.RebootReasons = @(Get-PendingRebootReasons)
             if ($script:Report.RebootReasons.Count) { $script:Report.RebootRequired = $true }
             $script:Report.After = [pscustomobject]@{ Office=$office; Teams=$teams; Policies=$policies; Google=$google }
-            $script:Report.Checks = @(Get-DeploymentChecks $config $office $teams $policies $google $directory)
+            $script:Report.Checks = @(Get-DeploymentChecks $config $office $teams $policies $google $directory $Mode $script:Report.Applications)
             $script:Report.Errors += @($teams.Errors) + @($policies.Errors) + @($policies.Conflicts)
-            $script:Report.Activation = Get-OfficeActivation $config.ProductId
-            if ($script:Report.Activation.Status -ne 'Licensed') { $script:Report.Notes += 'Employee license/activation is unverified or pending. Run Check-OfficeActivation.ps1 as the employee after licensed account sign-in.' }
-            $script:Report.Status = Get-DeploymentStatus $script:Report.Checks $script:Report.Errors $script:Report.RebootRequired $script:Report.Pending
+            foreach ($message in @($teams.Errors) + @($policies.Errors)) { Add-RunIssue (New-DeploymentIssue 'TNO-200' $message 'Inventory') }
+            foreach ($message in $policies.Conflicts) { Add-RunIssue (New-DeploymentIssue 'TNO-202' $message 'Policy') }
+            $script:Report.Activation = [pscustomobject]@{Status='Deferred';Reason='No sign-in, activation or license-status query attempted. An employee may activate Office later using their licensed account.'}
+            if ($Mode -eq 'Deploy' -and $config.AppMode -eq 'Install') {
+                foreach ($check in @($script:Report.Checks | Where-Object {$_.Category -eq 'Application' -and !$_.Pass})) {
+                    $script:Report.AppIssues += "Application validation did not pass: $($check.Name). See the check evidence; cleanup results remain separate."
+                    Add-RunIssue (New-DeploymentIssue 'TNO-404' "Application validation did not pass: $($check.Name)." 'Application validation')
+                }
+            }
+            $script:Report.Status = Get-DeploymentStatus $script:Report.Checks $script:Report.Errors $script:Report.RebootRequired $script:Report.Pending $script:Report.AppIssues
             if ($Mode -eq 'Plan' -and !$script:Report.Errors.Count) { $script:Report.Status = 'Planned' }
-        } catch { $script:Report.Errors += "Validation: $_"; $script:Report.Status = 'Failed' }
+        } catch { $script:Report.Errors += "Validation: $_"; $script:Report.Status = 'Failed'; Add-RunIssue (New-DeploymentIssue 'TNO-200' $_.Exception.Message 'Validation' 'Error' $_) }
+        foreach ($message in $script:Report.Pending) { Add-RunIssue (New-DeploymentIssue 'TNO-203' $message 'Cleanup' 'Pending') }
+        foreach ($task in $script:Report.UserCleanup) {
+            if ($task.LastTaskResult -notin @(0,3010,267009,267011) -and @($script:Report.Pending | Where-Object {$_ -like "*$($task.TaskName)*"}).Count) { Add-RunIssue (New-DeploymentIssue 'TNO-206' "Cleanup task $($task.TaskName) returned $($task.LastTaskResult)." 'User cleanup' 'Pending') }
+        }
+        if ($script:Report.RebootRequired) { Add-RunIssue (New-DeploymentIssue 'TNO-207' 'A reboot is required before final verification.' 'Cleanup' 'Pending') }
+        foreach ($check in @($script:Report.Checks | Where-Object {$_.Required -and !$_.Pass})) {
+            Add-RunIssue (New-DeploymentIssue $(if ($check.Name -eq 'TeamsPreventionPolicy') {'TNO-202'} elseif ($check.Category -eq 'Application') {'TNO-404'} else {'TNO-203'}) "Check did not pass: $($check.Name)." 'Final verification')
+        }
         $script:Report.FinishedUTC = (Get-Date).ToUniversalTime().ToString('o')
-        $script:Report.Steps += '10 Generate detailed deployment report'
-        $path = Write-DeploymentReport $script:Report $directory
-        [pscustomobject]@{ Status=$script:Report.Status; ReportPath=$path }
+        $script:Report.Steps += '10 Return results to the application in memory'
+        [pscustomobject]@{ Status=$script:Report.Status; Report=$script:Report }
     } finally { if ($locked) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
 }
 

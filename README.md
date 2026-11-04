@@ -4,7 +4,7 @@ Windows 11 cleanup and workstation provisioning, with a restore point before dep
 
 <div align="center">
 
-![version](https://img.shields.io/badge/version-2.0.0-dab467.svg)
+![version](https://img.shields.io/badge/version-2.2.0-dab467.svg)
 ![status](https://img.shields.io/badge/status-preview-64748b.svg)
 ![platform](https://img.shields.io/badge/Windows_11-x64-0078D4.svg)
 ![launcher](https://img.shields.io/badge/C%23-WinForms-512BD4.svg)
@@ -23,7 +23,8 @@ Windows 11 cleanup and workstation provisioning, with a restore point before dep
 - [🛟 Restore Point](#-restore-point)
 - [⚙️ Architecture](#️-architecture)
 - [📁 Repository Structure](#-repository-structure)
-- [🔎 Reports](#-reports)
+- [🔎 Results](#-results)
+- [Error codes](docs/ERROR_CODES.md)
 - [🔧 Build and Test](#-build-and-test)
 - [🚧 Versions](#-versions)
 - [🔗 References](#-references)
@@ -35,14 +36,18 @@ Windows 11 cleanup and workstation provisioning, with a restore point before dep
 ## 📄 Description
 
 **TinnosDebloat-Win11** prepares an existing Windows 11 installation for work. It
-removes Microsoft Teams, installs Microsoft 365 Apps for Business, Chrome and
-Google Drive, and checks the resulting state. It works on the running Windows
+removes Microsoft Teams, downloads Microsoft 365 Apps for Business, Chrome and
+Google Drive, and checks the resulting state. App installation is optional; a
+failed app is reported and skipped while the others continue. It works on the running Windows
 installation; no Windows reinstall or custom image is needed.
 
 This project was created with assistance from OpenAI Codex.
 
-The name references Tinnos in *Tomb Raider III: Adventures of Lara Croft*. This is an
-independent utility with no affiliation with the game or its publishers.
+The name references the Lost City of Tinnos in *Tomb Raider III: Adventures of Lara
+Croft*. We are clearing annoying things out of Windows, much like dealing with
+those green flying enemies in Tinnos: the **Tinnos Wasps**. The stage's giant wasps
+are described in [Stella's Tinnos walkthrough](https://tombraiders.net/stella/walks/TR3walk/A3-tinnos.html).
+This is an independent utility with no affiliation with the game or its publishers.
 
 The current cleanup scope is Teams and its installation paths. This tool does
 not remove an arbitrary list of Windows apps, disable Windows Update or Defender,
@@ -53,13 +58,13 @@ or erase personal documents.
 | Component | Behavior |
 | --- | --- |
 | Microsoft 365 Apps for Business | Official ODT, `O365BusinessRetail`, 64-bit, Current Channel |
-| Word, Excel, PowerPoint, classic Outlook, OneNote | Required and verified after deployment |
+| Word, Excel, PowerPoint, classic Outlook, OneNote | Included in Office media; verified on the device when installation is selected |
 | Access | Optional selection |
 | Teams | Always excluded; new, classic, personal, machine-wide and provisioned variants checked |
 | OneDrive | Excluded from Office when selected; existing standalone OneDrive and its documents are preserved |
 | New Outlook | Excluded from Office when selected; classic Outlook remains required |
-| Chrome | Official Google Enterprise MSI; supported browser association configuration |
-| Google Drive for desktop | Official Google installer; silent installation |
+| Chrome | Official Google Enterprise MSI; browser associations configured only in Install mode |
+| Google Drive for desktop | Official Google installer; downloaded by default, silent installation optional |
 
 ## 💡 Technologies
 
@@ -70,7 +75,7 @@ or erase personal documents.
 | Office deployment | Microsoft's Office Deployment Tool |
 | Teams removal | Official bootstrapper, Appx/MSIX servicing, supported legacy uninstallers |
 | Recovery | Windows System Restore |
-| Results | JSON, HTML, installer logs, download SHA-256 hashes |
+| Results | In-app results, mapped error codes, live log and download SHA-256 hashes |
 
 The portable executable embeds its PowerShell files. Target devices do not need
 Git, Python, a development SDK, or this source repository.
@@ -82,29 +87,52 @@ Git, Python, a development SDK, or this source repository.
 - Windows 11 x64, administrator access and an internet connection.
 - Windows PowerShell 5.1 and .NET Framework 4.x supplied with Windows.
 - Windows System Restore available and permitted by organization policy.
-- A valid **Microsoft 365 Apps for Business** subscription for Office activation.
+- Downloads need no Microsoft/Google account sign-in or Office activation.
+- Using Office later requires an appropriate Microsoft 365 Apps for Business license.
 
 ### Interface selections
 
+The window groups selections into **App action** and **Office options**.
+Office is always **Microsoft 365 Apps for Business, PT-BR, 64-bit**.
+The only action buttons are **Start** and **Details**.
+
 | Button | Default | Meaning |
 | --- | --- | --- |
-| PT-BR | Selected | Install Portuguese (Brazil) Office language |
-| English | Selected | Install English Office language |
-| Access | Off | Include Microsoft Access |
+| Download only | Selected | Save app installers/media without installing the apps or changing browser defaults |
+| Download + install | Off | Download app files and attempt silent installation |
+| Include Access | Off | Include Microsoft Access |
 | Exclude OneDrive | Selected | Exclude OneDrive from the Office deployment |
 | Exclude new Outlook | Selected | Exclude the new Outlook app from Office |
 
-Gold buttons are selected. Choose at least one language. The Office edition,
-Teams exclusion, 64-bit architecture and restore-point step are automatic.
+Gold selections are enabled. Office language is fixed to Portuguese (Brazil);
+there is no language selector. The Office edition, Teams exclusion, 64-bit
+architecture and restore-point step are automatic.
 The GUI uses Current Channel; administrators can select another supported update
 channel in JSON for command-line deployment.
+
+Leave **Download only** selected to save the files, or choose **Download + install**
+to attempt silent app installation. These modes are mutually exclusive. **Start**
+runs the selected action. **Details** expands the Results, Errors and Log tabs.
+Teams cleanup and restore-point handling still run with either action;
+Download only applies to Office, Chrome and Drive, not to cleanup.
+An app download/install error never cancels attempts for the remaining apps.
 
 ### Official downloads
 
 ODT is resolved automatically from [Microsoft Download Center, product 49117](https://www.microsoft.com/en-us/download/details.aspx?id=49117).
 There is no installer picker or configurable mirror. The engine extracts the
 official archive and verifies Microsoft's signature on both the archive and
-`setup.exe`. A changed page layout or invalid signature causes an explicit failure.
+`setup.exe`. If the page cannot be reached (including a `www.microsoft.com` DNS
+failure), it tries the official `download.microsoft.com` archive link verified
+for this release on 2026-11-04. The fallback is ODT 16.0.20430.20146; page-based
+discovery is preferred for the current version. Neither source requires sign-in.
+An invalid signature is rejected.
+
+Installer transfers try PowerShell `Invoke-WebRequest`, then Windows' inbox
+`curl.exe`, with HTTPS-only transfers, timeouts, nonempty-file checks and vendor
+signature verification. Failed or unsigned responses never become final installer
+files. A different downloader does not repair an unavailable internet connection
+or broken DNS; those failures remain explicit in Details and the next app is tried.
 
 The [Teams bootstrapper](https://go.microsoft.com/fwlink/?linkid=2243204&clcid=0x409)
 is used exclusively with uninstall arguments `-x -m`. Chrome and Drive come from
@@ -120,9 +148,9 @@ script collections or unofficial mirrors.
 
 1. Copy [tinnosdebloat-win11.exe](tinnosdebloat-win11.exe?raw=true) to the target device.
 2. Open it and approve the Windows administrator request.
-3. Select languages and optional Office components.
-4. Use **Audit** to inspect the device, or **Start** to apply the deployment.
-5. Open **Reports** for results. **Details** expands the execution log.
+3. Choose the app action and optional Office components. Office language is always PT-BR.
+4. Select **Start** to run cleanup and the chosen download/install action.
+5. Select **Details** to view results, error codes and the live log inside the application.
 
 Opening the app does not deploy anything. Closing is blocked while an operation
 is running, so installers are not interrupted by closing the window.
@@ -151,8 +179,17 @@ Start-Process .\tinnosdebloat-win11.exe `
 ```
 
 Modes are `Audit`, `Plan` and `Deploy`. An optional `--output <folder>` changes the
-report location. Plan generates XML without deploying software. The Business
-product is fixed; unknown fields, license keys and custom installer URLs are rejected.
+working-file location. These advanced modes remain available through the command
+line; the GUI has no Audit button. Plan generates XML without deploying software.
+The Business product and `"Languages": ["pt-br"]` are fixed; other languages,
+unknown fields, license keys and custom installer URLs are rejected.
+
+`"AppMode": "Download"` is the default. Set `"AppMode": "Install"` to attempt app
+installation. Office download mode runs ODT `/download` and verifies the media;
+it never runs `/configure`. Office data is saved under `OfficeMedia`, and Chrome
+and Drive installers are saved beside the generated Office XML. If moving Office
+media to another folder or device for later installation, update the XML's absolute
+`SourcePath` to the copied `OfficeMedia` folder.
 
 ### Execution policy and activation
 
@@ -162,12 +199,12 @@ execution policy. **Group Policy MachinePolicy/UserPolicy still take precedence*
 A centrally blocked or AllSigned-only deployment requires organization-approved
 script signing or management configuration. The tool reports the block.
 
-The employee activates Office with their licensed Microsoft 365 account. No keys,
-passwords or licensing bypasses are included. Reports run `vnextdiag.ps1 -action list`
-read-only and distinguish `Licensed`, `NotLicensed` and `Unknown`. An administrator
-or SYSTEM result does not prove employee activation. The extracted
-`Check-OfficeActivation.ps1` can check in the employee's account using permitted
-PowerShell execution settings.
+The deployment never signs in, requests credentials, activates Office or queries
+the employee's license. Details shows activation as **Deferred**, which does not
+block downloads or installation. There is no key, password or licensing bypass.
+An employee may activate Office later using their licensed account. The separate
+`Check-OfficeActivation.ps1` remains an optional manual diagnostic; deployment
+does not invoke it.
 
 ## 🛟 Restore Point
 
@@ -201,19 +238,27 @@ flowchart TD
     F --> G[Preserve Teams data]
     G --> H[Remove Teams apps and provisioning]
     H --> I[Configure installation prevention]
-    I --> J{Teams fully removed?}
+    I --> Q{App mode}
+    Q -->|Download| L[Download apps / optionally install]
+    Q -->|Install| J{Teams fully removed?}
     J -->|Pending| K[Report sign-in / retry / reboot action]
-    J -->|Yes| L[Install Office Business with Teams excluded]
-    L --> M[Install Chrome and Google Drive]
-    M --> N[Configure browser associations]
-    N --> O[Validate apps, profiles, policies and activation]
-    O --> P[JSON + HTML reports]
+    J -->|Yes| L
+    L --> M[Record each app; continue after app errors]
+    M --> N[Configure browser associations in Install mode]
+    N --> O[Validate app results, profiles and policies]
+    O --> P[Results and coded errors inside the application]
 ```
 
 Matching Office installations are skipped. Product, bitness, apps, languages,
 channel and exclusions must all match. Incompatible Office installations and
 central update-policy conflicts require administrator remediation. Documents and
 applications are not force-closed.
+
+Matching-install checks apply only to Install mode. Download mode can prepare
+Office media regardless of the installed Office edition. Pending Teams cleanup
+blocks application installation; downloading the app files can continue without
+claiming Teams is absent. Restore-point and centrally managed policy blockers
+remain enforced.
 
 Classic Teams profiles use limited interactive tasks named
 `TinnosDebloat-Win11-RemoveTeams-<SID>`, without saved credentials. Offline profiles
@@ -239,48 +284,61 @@ tinnosdebloat-win11/
 ├── Check-OfficeActivation.ps1
 ├── Provisioning.psm1
 ├── config.example.json
+├── error-codes.json             # Shared error catalog
 ├── src/
 │   ├── Program.cs
 │   └── app.manifest
 ├── tests/
 │   └── Run-Tests.ps1
 ├── docs/
-│   └── interface.png
+│   ├── interface.png
+│   └── ERROR_CODES.md
 └── README.md
 ```
 
 Only the `.exe` is needed on target devices. Source and tests remain in the
 repository for review and rebuilding.
 
-## 🔎 Reports
+## 🔎 Results
 
-Default runtime location:
+**Details** displays the current run inside the application:
 
-```text
-C:\ProgramData\TinnosDebloat-Win11\Runs\<run-id>\
-├── launcher.log
-├── config.json
-├── extracted PowerShell files
-└── Reports\<deployment-id>\
-    ├── report.html
-    ├── report.json
-    ├── office-configuration.xml
-    ├── installer logs and download evidence
-    └── PreservedTeamsData\     # When data required preservation
-```
+- **Results:** restore point, individual applications, cleanup and policy checks.
+- **Errors:** stable `TNO-xxx` codes, the original message, recovery action and native exit code when available.
+- **Log:** live execution output and additional notes.
+
+Results and the live log stay in memory and are lost when the application closes.
+The tool does not write `report.html`, `report.json` or `launcher.log`.
+For troubleshooting, use the [error-code reference](docs/ERROR_CODES.md).
+For example, `TNO-300` identifies DNS resolution failure and `TNO-400` identifies
+a vendor installer/uninstaller failure; the native exit code gives further detail.
+
+Downloaded installers, Office media/XML, extracted scripts, configuration and
+pending cleanup-task dependencies still need working files under
+`C:\ProgramData\TinnosDebloat-Win11\Runs\<run-id>\Work` and its parent run directory.
+Protected `PreservedTeamsData` is retained when user data needs preservation.
+Windows and vendor tools may create their own system logs. Reports left by older
+versions are not automatically deleted.
 
 | Exit code | Result |
 | --- | --- |
 | `0` | Passed audit/deployment, or generated plan; inspect mode and checks |
 | `1` | Failure, unreadable inventory or policy conflict |
-| `3010` | Pending reboot, profile logon, restore availability or retry; read the report |
+| `2` | Cleanup checks passed, but some app operations failed or were skipped (`CompletedWithIssues`) |
+| `3010` | Pending reboot, profile logon, restore availability or retry; read Details |
 
-Reports include restore-point outcomes, before/after inventory, policies, remaining
-Teams components, application checks and account-scoped activation. Inaccessible
+In-memory results include restore-point outcomes, before/after inventory, policies, remaining
+Teams components, individual app outcomes and deferred activation. Inaccessible
 relevant inventory prevents a claim of complete removal. Complete provisioning
 does not imply that the employee's Office account is activated.
 
-Keep runtime directories while tasks are pending. They hold task dependencies and
+The Applications summary distinguishes `Downloaded`, `Installed`, `AlreadyInstalled`
+and `Failed`. Required cleanup checks are separated from app observations.
+Downloading an installer never reports its app as installed. Failed optional apps
+produce `CompletedWithIssues` only when the required cleanup checks pass; remaining
+Teams, unreadable profiles or policy conflicts cannot be hidden by skipping apps.
+
+Keep working directories while tasks are pending. They hold task dependencies and
 may contain preserved Teams data/authentication material; apply your retention
 rules. Never commit device reports or preserved data to GitHub. `.gitignore`
 excludes runtime paths, local configuration and logs.
@@ -300,6 +358,30 @@ mocks. They do not install software, change execution policies or create restore
 points. The preview is rendered from the real form without starting deployment.
 
 ## 🚧 Versions
+
+<details>
+<summary><strong>[See/Hide] Version 2.2.0 — Results inside the app</strong></summary>
+
+- Fixed PT-BR Office configuration and removed language selectors.
+- Only Start and Details action buttons, with Results, Errors and Log tabs.
+- In-memory results replace saved deployment reports and launcher logs.
+- Shared error catalog with recovery actions and native installer exit codes.
+- Updated interface screenshot, tests and Tinnos Wasps naming reference.
+
+</details>
+
+<details>
+<summary><strong>[See/Hide] Version 2.1.0 — Download and continue</strong></summary>
+
+- Download-only default with optional app installation.
+- Grouped action, language and Office settings; explicit mode choices and a clear primary action.
+- Independent Office, Chrome and Drive operations; failures are skipped and reported.
+- Official Microsoft archive fallback for unavailable Download Center discovery.
+- PowerShell transfers with a Windows curl fallback and vendor signature checks.
+- No automatic sign-in, activation or license-status query.
+- Clear app outcomes and `CompletedWithIssues` status.
+
+</details>
 
 <details>
 <summary><strong>[See/Hide] Version 2.0.0 — Tinnos</strong></summary>

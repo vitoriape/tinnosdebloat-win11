@@ -1,10 +1,10 @@
 #Requires -Version 5.1
 # Runs with the affected user's interactive token, never with an administrator's HKCU.
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$ResultPath)
+param()
 $ErrorActionPreference = 'Stop'
 Import-Module "$PSScriptRoot\Provisioning.psm1" -Force
 $result = Invoke-TeamsUserCleanup
-$result | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $ResultPath -Encoding UTF8
 if ($result.Errors.Count) { exit 1 }
+if ($result.RebootRequired) { exit 3010 }
 exit 0
