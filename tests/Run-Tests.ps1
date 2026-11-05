@@ -32,7 +32,7 @@ try {
     }
     Test 'Business license and x64 defaults are fixed' {
         Assert ($config.ProductId -eq 'O365BusinessRetail' -and $config.Architecture -eq '64') 'Wrong product/architecture.'
-        Assert ($config.AppMode -eq 'Download') 'Default must download without installation.'
+        Assert ($config.AppMode -eq 'Install' -and $config.InstallItems.Count -eq 3) 'Default must install the selected gear.'
         Assert ($config.Languages.Count -eq 1 -and $config.Languages[0] -eq 'pt-br') 'Office language must be fixed to PT-BR.'
         Throws { Get-OfficeProductId 'Enterprise' }
         $path=Join-Path $work 'minimal.json'; '{}' | Set-Content -LiteralPath $path
@@ -55,14 +55,15 @@ try {
         $excluded=@($xml.Configuration.Add.Product.ExcludeApp | ForEach-Object {$_.ID})
         Assert ($xml.Configuration.Add.Product.ID -eq 'O365BusinessRetail') 'Wrong product.'
         Assert ('Teams' -in $excluded -and 'OutlookForWindows' -in $excluded -and 'Groove' -in $excluded) 'Required exclusion missing.'
-        Assert (!@($excluded | Where-Object {$_ -in @('Word','Excel','PowerPoint','Outlook','OneNote')}).Count) 'Required app excluded.'
+        Assert (!@($excluded | Where-Object {$_ -in @('Word','Excel','PowerPoint','OneNote')}).Count) 'Required app excluded.'
+        foreach ($id in @('Access','OneDrive','Outlook','OutlookForWindows')) {Assert ($id -in $excluded) ('Fixed exclusion missing: '+$id)}
         Assert ($xml.Configuration.Display.Level -eq 'None' -and $xml.Configuration.Property.Value -eq 'FALSE') 'Unsafe UI/document settings.'
         Assert (!$xml.SelectNodes('//Remove|//RemoveMSI|//PIDKEY').Count) 'Unexpected removal or key.'
     }
-    Test 'Access selection is honored' {
+    Test 'Legacy Office flags cannot re-enable excluded apps' {
         $optional=Read-DeploymentConfig (Join-Path $root 'config.example.json'); $optional.IncludeAccess=$true
         $excluded=Get-DesiredExclusions $optional $null
-        Assert ('Access' -notin $excluded -and 'Teams' -in $excluded) 'Optional Access selection lost.'
+        Assert ('Access' -in $excluded -and 'Outlook' -in $excluded -and 'OneDrive' -in $excluded) 'Fixed Office exclusions could be overridden.'
     }
     Test 'Official ODT URL resolves from HTML and escaped JSON' {
         $url='https://download.microsoft.com/download/test/officedeploymenttool_current.exe'
@@ -138,7 +139,7 @@ try {
         try { Assert ((New-DeploymentRestorePoint).Status -eq 'ReusedRecent') 'Recent point not reported.' }
         finally { Reset-Engine }
     }
-    Test 'Restore failure skips system changes but allows independent downloads (mocked)' {
+    Test 'Restore failure does not run unrequested downloads or system changes (mocked)' {
         $module=Get-Module Provisioning
         & $module {
             $script:Report=[pscustomobject]@{Steps=@();RestorePoint=$null;Errors=@();Issues=@();Applications=@();AppIssues=@();Notes=@()}; $script:MutationReached=$false; $script:Downloads=0
@@ -154,7 +155,7 @@ try {
             Invoke-DeploymentSteps $config $null $null $null 'unused' $work
             Assert ((& $module {$script:Report.Issues[0].Code}) -eq 'TNO-201') 'Restore failure not reported.'
             Assert (!(& $module {$script:MutationReached})) 'Software mutation preceded restore point.'
-            Assert ((& $module {$script:Downloads}) -eq 3) 'Independent downloads did not continue.'
+            Assert ((& $module {$script:Downloads}) -eq 0) 'Unrequested fallback downloads were started.'
         } finally { Reset-Engine }
     }
     Test 'Organization restore policy is preserved (mocked)' {
@@ -232,7 +233,8 @@ try {
             function script:Set-ChromeDefault {throw 'Must not change defaults in download-only mode'}
         }
         try {
-            Invoke-DeploymentSteps $config $null $null $null 'unused' $work
+            $downloadConfig=$config.PSObject.Copy();$downloadConfig.AppMode='Download'
+            Invoke-DeploymentSteps $downloadConfig $null $null $null 'unused' $work
             $result=& $module {$script:Report}
             Assert ($result.Applications.Count -eq 3 -and !$result.AppIssues.Count) 'Download-only unexpectedly installed or skipped apps.'
             Assert (!@($result.Applications | Where-Object {$_.Status -ne 'Downloaded'}).Count) 'Downloads misrepresented as installations.'
@@ -250,7 +252,8 @@ try {
             function script:Test-OfficeMatches {throw 'An existing Office license is irrelevant to downloading media'}
         }
         try {
-            $media=Install-Office $config $null $null $xmlPath $work
+            $downloadConfig=$config.PSObject.Copy();$downloadConfig.AppMode='Download'
+            $media=Install-Office $downloadConfig $null $null $xmlPath $work
             $calls=@(& $module {$script:Args})
             Assert ($media.Status -eq 'Downloaded' -and $calls.Count -eq 1 -and $calls[0] -like '/download *') 'Office configure/activation was requested.'
         } finally {Reset-Engine}
@@ -355,11 +358,11 @@ try {
     }
     Test 'Removal configuration validates IDs and requires explicit selection of high impact services' {
         Assert ('DarkMode' -in $config.RemoveItems -and 'DesktopIcons' -in $config.RemoveItems -and 'TaskbarSearch' -in $config.RemoveItems -and 'TaskbarWidgets' -in $config.RemoveItems) 'Desktop defaults missing.'
-        foreach($id in @('BitLockerService','RemoteDesktop','Biometrics','SmartCard','ServerService')) {Assert ($id -notin $config.RemoveItems) ('High impact default: '+$id)}
+        foreach($id in @('BitLockerService','RemoteDesktop','RemoteDesktopConnection','Biometrics','SmartCard','ServerService')) {Assert ($id -notin $config.RemoveItems) ('High impact default: '+$id)}
         $path=Join-Path $work 'choices.json'
         '{"RemoveItems":["Paint"]}' | Set-Content -LiteralPath $path
         $selected=Read-DeploymentConfig $path
-        Assert ($selected.RemoveItems.Count -eq 2 -and 'Teams' -in $selected.RemoveItems -and 'Paint' -in $selected.RemoveItems) 'Selections not respected.'
+        Assert ($selected.RemoveItems.Count -eq 1 -and 'Teams' -notin $selected.RemoveItems -and 'Paint' -in $selected.RemoveItems) 'Unchecked Teams was added to the selection.'
         '{"RemoveItems":["Defender"]}' | Set-Content -LiteralPath $path
         Throws {Read-DeploymentConfig $path}
     }
@@ -438,7 +441,7 @@ try {
         try {
             $cfg=$config.PSObject.Copy();$cfg.RemoveItems=@('Clipchamp','Copilot','SearchIndexing')
             Invoke-SelectedDebloat $cfg $work
-            Assert ((& $module {$script:Trace -join ','}) -eq 'Clipchamp.Clipchamp,Microsoft.Copilot,Microsoft.CopilotDev,WSearch') 'Failure stopped selected cleanup.'
+            Assert ((& $module {$script:Trace -join ','}) -eq 'Clipchamp.Clipchamp,Microsoft.Copilot,Microsoft.CopilotDev,Microsoft.MicrosoftOfficeHub,WSearch') 'Failure stopped selected cleanup.'
             Assert ((& $module {$script:Report.Applications[-1].Status}) -eq 'Disabled') 'Last operation did not complete.'
         } finally {Reset-Engine}
     }
@@ -508,6 +511,197 @@ try {
             Assert ((Install-GoogleDrive $work).Status -eq 'Installed') 'Drive not verified.'
             $arguments=& $module {$script:Args}
             Assert ($arguments.Contains('--gsuite_shortcuts=false') -and !$arguments.Contains('--desktop_shortcut')) 'Unwanted Google shortcuts requested.'
+        } finally {Reset-Engine}
+    }
+    Test 'Dell MSI removal matches only catalog products and verifies absence (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Removed=$false;$script:Args='';$script:Report=[pscustomobject]@{Issues=@()}
+            function script:Get-CimInstance {}
+            function script:Get-UninstallEntries {
+                if (!$script:Removed) {[pscustomobject]@{Name='Dell SupportAssist';Publisher='Dell Inc.';Scope='HKLM:';Key='{12345678-1234-1234-1234-123456789ABC}';WindowsInstaller=1;QuietUninstallString=''}}
+                [pscustomobject]@{Name='Dell System Driver';Publisher='Dell Inc.';Scope='HKLM:';Key='{99999999-1234-1234-1234-123456789ABC}';WindowsInstaller=1;QuietUninstallString=''}
+            }
+            function script:Invoke-Installer {param($FilePath,$Arguments);$script:Args=$Arguments;$script:Removed=$true;return 0}
+        }
+        try {
+            Assert ((Remove-DesktopUtility DellSupportAssist).Status -eq 'Removed') 'Dell removal not verified.'
+            Assert ((& $module {$script:Args}) -eq '/x {12345678-1234-1234-1234-123456789ABC} /qn /norestart') 'Unrelated driver or unsafe MSI flags targeted.'
+        } finally {Reset-Engine}
+    }
+    Test 'Unknown desktop uninstallers and wrong publishers are reported without executing (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Executed=$false;$script:Report=[pscustomobject]@{Issues=@()};$script:Publisher='Unrelated Publisher'
+            function script:Get-CimInstance {}
+            function script:Get-UninstallEntries {[pscustomobject]@{Name='Dell SupportAssist';Publisher=$script:Publisher;Scope='HKLM:';Key='not-an-msi';WindowsInstaller=0;QuietUninstallString='';UninstallString='cmd.exe /c unsafe'}}
+            function script:Invoke-Installer {$script:Executed=$true}
+        }
+        try {
+            Throws {Remove-DesktopUtility DellSupportAssist}
+            & $module {$script:Publisher='Dell Inc.'}
+            Throws {Remove-DesktopUtility DellSupportAssist}
+            Assert (!(& $module {$script:Executed})) 'An unsupported uninstaller was executed.'
+            Assert ((& $module {$script:Report.Issues[-1].Code}) -eq 'TNO-504') 'Manual action missing.'
+            Throws {Get-DesktopQuietCommand ([pscustomobject]@{QuietUninstallString='"C:\Windows\System32\cmd.exe" /c unsafe';Name='fixture'}) Dell}
+        } finally {Reset-Engine}
+    }
+    Test 'Armoury Crate requires the official complete uninstall tool instead of a partial app deletion (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            function script:Get-CimInstance {}
+            function script:Get-UninstallEntries {[pscustomobject]@{Name='ARMOURY CRATE Service';Publisher='ASUSTeK COMPUTER INC.'}}
+            function script:Get-AppxPackage {}
+            function script:Get-AppxProvisionedPackage {}
+            function script:Invoke-Installer {throw 'Must not guess silent tool flags'}
+        }
+        try {
+            try {Remove-DesktopUtility ASUSArmouryCrate;throw 'Manual removal not required'} catch {
+                Assert ((Get-TinnosErrorCode $_) -eq 'TNO-504' -and $_.Exception.Message.Contains('https://www.asus.com/support/faq/1041654/')) 'Official manual action not provided.'
+            }
+        } finally {Reset-Engine}
+    }
+    Test 'Remote Desktop Connection uses the official visible uninstaller without automatic restart or deleting RDP files (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Removed=$false;$script:Report=[pscustomobject]@{Issues=@();Pending=@()}
+            function script:Get-RemoteDesktopConnectionState {[pscustomobject]@{Present=(!$script:Removed);Paths=@()}}
+            function script:Get-ItemProperty {[pscustomobject]@{CurrentBuildNumber='26100'}}
+            function script:Get-Process {}
+            function script:Test-Path {return $true}
+            function script:Assert-Publisher {param($Path,$Publisher);if ($Publisher -ne 'Microsoft') {throw 'Wrong publisher'}}
+            function script:Invoke-Installer {param($FilePath,$Arguments,$SuccessCodes,[switch]$Interactive);if ($FilePath -notlike '*\System32\mstsc.exe' -or $Arguments -ne '/uninstall' -or !$Interactive) {throw 'Unsupported or hidden uninstall'};$script:Removed=$true;return 0}
+            function script:Remove-Item {throw 'Saved RDP files must not be deleted'}
+        }
+        try {Assert ((Remove-RemoteDesktopConnection).Status -eq 'Removed') 'Remote Desktop Connection removal not verified.'} finally {Reset-Engine}
+    }
+    Test 'Unsupported Windows and active Remote Desktop client sessions block only the affected removal (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Build='22000';$script:Executed=$false
+            function script:Get-RemoteDesktopConnectionState {[pscustomobject]@{Present=$true;Paths=@()}}
+            function script:Get-ItemProperty {[pscustomobject]@{CurrentBuildNumber=$script:Build}}
+            function script:Get-Process {[pscustomobject]@{Name='mstsc'}}
+            function script:Invoke-Installer {$script:Executed=$true}
+        }
+        try {
+            Throws {Remove-RemoteDesktopConnection}
+            & $module {$script:Build='26100'}
+            try {Remove-RemoteDesktopConnection;throw 'Active connection was ignored'} catch {Assert ((Get-TinnosErrorCode $_) -eq 'TNO-403') 'Active sessions were not protected.'}
+            Assert (!(& $module {$script:Executed})) 'Blocked uninstaller was started.'
+        } finally {Reset-Engine}
+    }
+    Test 'Remaining Remote Desktop binaries are reported as pending instead of removed (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Report=[pscustomobject]@{Issues=@();Pending=@()}
+            function script:Get-RemoteDesktopConnectionState {[pscustomobject]@{Present=$true;Paths=@('mstsc.exe')}}
+            function script:Get-ItemProperty {[pscustomobject]@{CurrentBuildNumber='26100'}}
+            function script:Get-Process {}
+            function script:Test-Path {return $true}
+            function script:Assert-Publisher {}
+            function script:Invoke-Installer {return 0}
+        }
+        try {
+            Assert ((Remove-RemoteDesktopConnection).Status -eq 'Pending') 'Remaining client reported removed.'
+            Assert ((& $module {$script:Report.Pending.Count}) -eq 1 -and (& $module {$script:Report.Issues[0].Code}) -eq 'TNO-504') 'Pending action was not reported.'
+        } finally {Reset-Engine}
+    }
+    Test 'Drive-only selection does not touch Office, Teams, unrelated cleanup or browser defaults (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Report=[pscustomobject]@{Steps=@();RestorePoint=$null;Errors=@();Issues=@();Applications=@();AppIssues=@();Notes=@()};$script:Trace=@()
+            function script:New-DeploymentRestorePoint {$script:Trace+='restore';[pscustomobject]@{Status='Created'}}
+            function script:Install-GoogleDrive {$script:Trace+='drive';[pscustomobject]@{Status='Installed'}}
+            function script:Install-Office {throw 'Unrequested Office install'}
+            function script:Install-GoogleChrome {throw 'Unrequested Chrome install'}
+            function script:Remove-TeamsApplications {throw 'Unchecked Teams removal'}
+            function script:Invoke-SelectedDebloat {throw 'No removals selected'}
+            function script:Set-TeamsPrevention {throw 'Unrequested Office policy'}
+            function script:Set-ChromeDefault {throw 'Unrequested Chrome default'}
+        }
+        try {
+            $cfg=$config.PSObject.Copy();$cfg.InstallItems=@('GoogleDrive');$cfg.RemoveItems=@()
+            Invoke-DeploymentSteps $cfg $null $null $null 'unused' $work
+            Assert ((& $module {$script:Trace -join ','}) -eq 'restore,drive') 'Unexpected mutation outside the selected scope.'
+            Assert ((& $module {$script:Report.Applications.Count}) -eq 1 -and (& $module {$script:Report.Issues.Count}) -eq 0) 'Drive-only selection failed.'
+        } finally {Reset-Engine}
+    }
+    Test 'Empty selection performs no restore, install or removal (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {function script:New-DeploymentRestorePoint {throw 'Empty selection must do nothing'}}
+        try {
+            $cfg=$config.PSObject.Copy();$cfg.InstallItems=@();$cfg.RemoveItems=@()
+            Invoke-DeploymentSteps $cfg $null $null $null 'unused' $work
+            Assert ((& $module {$script:Events[-1].Message}) -match 'Nothing selected') 'Empty selection was not explained.'
+        } finally {Reset-Engine}
+    }
+    Test 'Validation ignores unchecked applications and does not claim unchecked Teams removal (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {function script:Test-Path {return $false}}
+        try {
+            $cfg=$config.PSObject.Copy();$cfg.InstallItems=@('GoogleDrive');$cfg.RemoveItems=@()
+            $office=[pscustomobject]@{Present=$false;Apps=[pscustomobject]@{};ExcludedApps=@()}
+            $teams=Empty-Teams;$teams.Packages=@('Teams intentionally kept')
+            $policy=[pscustomobject]@{PreventTeamsInstall=0;Errors=@();Conflicts=@()}
+            $google=[pscustomobject]@{Chrome=@();Drive=@('GoogleDriveFS.exe')}
+            $checks=@(Get-DeploymentChecks $cfg $office $teams $policy $google $work Deploy @())
+            Assert (!@($checks | Where-Object {$_.Name -match 'Teams|Office|Word|Excel|Chrome|Outlook'}).Count) 'Unchecked components were validated as requested work.'
+            Assert ('GoogleDrive' -in $checks.Name -and (Get-DeploymentStatus $checks @() $false @()) -eq 'Complete') 'Drive-only validation failed.'
+        } finally {Reset-Engine}
+    }
+    Test 'Service startup is changed only after a pending stop reaches Stopped (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:StoppedRequested=$false;$script:Poll=0;$script:Disabled=$false
+            function script:Assert-ServicePolicy {}
+            function script:Get-Service {[pscustomobject]@{Status='Running'}}
+            function script:Get-CimInstance {
+                if ($script:StoppedRequested) {$script:Poll++}
+                [pscustomobject]@{State=$(if (!$script:StoppedRequested) {'Running'} elseif ($script:Poll -lt 2) {'Stop Pending'} else {'Stopped'});StartMode=$(if ($script:Disabled) {'Disabled'} else {'Auto'})}
+            }
+            function script:Stop-Service {$script:StoppedRequested=$true}
+            function script:Start-Sleep {}
+            function script:Set-Service {if ($script:Poll -lt 2) {throw 'Service still stopping'};$script:Disabled=$true}
+        }
+        try {
+            Assert ((Disable-SelectedService WSearch).Status -eq 'Disabled') 'Service stop was not awaited.'
+            Assert (@(& $module {$script:Events | Where-Object {$_.Kind -eq 'Progress'}}).Count -gt 0) 'Service stop wait not shown.'
+        } finally {Reset-Engine}
+    }
+    Test 'Selected Copilot cleanup runs again after Office without installing unchecked gear (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            $script:Report=[pscustomobject]@{Steps=@();RestorePoint=$null;Errors=@();Issues=@();Applications=@();AppIssues=@();Notes=@()};$script:Trace=@()
+            function script:New-DeploymentRestorePoint {[pscustomobject]@{Status='Created'}}
+            function script:Invoke-SelectedDebloat {param($Config);if ('Copilot' -notin $Config.RemoveItems) {throw 'Wrong post-install selection'};$script:Trace+='copilot'}
+            function script:Set-TeamsPrevention {}
+            function script:Remove-TeamsApplications {throw 'Unchecked Teams removal'}
+            function script:Install-Office {$script:Trace+='office';[pscustomobject]@{Status='Installed'}}
+            function script:Install-GoogleChrome {throw 'Unchecked Chrome install'}
+            function script:Install-GoogleDrive {throw 'Unchecked Drive install'}
+        }
+        try {
+            $cfg=$config.PSObject.Copy();$cfg.InstallItems=@('Office');$cfg.RemoveItems=@('Copilot')
+            Invoke-DeploymentSteps $cfg $null $null $null 'unused' $work
+            Assert ((& $module {$script:Trace -join ','}) -eq 'copilot,office,copilot') 'Copilot cleanup was not repeated after Office.'
+        } finally {Reset-Engine}
+    }
+    Test 'A service that remains active fails final verification even after an earlier Disabled result (mocked)' {
+        $module=Get-Module Provisioning
+        & $module {
+            function script:Test-Path {return $false}
+            function script:Get-CimInstance {[pscustomobject]@{Name='WSearch';StartMode='Disabled';State='Running'}}
+        }
+        try {
+            $cfg=$config.PSObject.Copy();$cfg.InstallItems=@();$cfg.RemoveItems=@('SearchIndexing')
+            $office=[pscustomobject]@{Present=$false;Apps=[pscustomobject]@{};ExcludedApps=@()}
+            $policy=[pscustomobject]@{PreventTeamsInstall=0;Errors=@();Conflicts=@()}
+            $google=[pscustomobject]@{Chrome=@();Drive=@()}
+            $apps=@([pscustomobject]@{Name='WSearch';Action='Disable';Status='Disabled'})
+            $checks=@(Get-DeploymentChecks $cfg $office (Empty-Teams) $policy $google $work Deploy $apps)
+            Assert (!(($checks | Where-Object {$_.Name -eq 'WSearch'}).Pass)) 'Running service reported stopped.'
+            Assert ((Get-DeploymentStatus $checks @() $false @()) -eq 'Failed') 'Incomplete service change reported complete.'
         } finally {Reset-Engine}
     }
     $exe=Join-Path $root 'tinnosdebloat-win11.exe'
@@ -586,30 +780,34 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
         Assert ($events[-1].Kind -eq 'Success') 'Accepted process exit not confirmed.'
         Reset-Engine
     }
-    Test 'Interface has only Start and Details actions with fixed Office language' {
+    Test 'Interface separates installation and removal, labels every action and serializes exact selections' {
         Add-Type -AssemblyName System.Windows.Forms
         $form=$assembly.GetType('TinnosDebloat.Ui').GetMethod('Create').Invoke($null,@())
         function Walk-Controls($Control) { foreach ($child in $Control.Controls) {$child; Walk-Controls $child} }
         try {
             $controls=@(Walk-Controls $form)
             Assert ($form.Text -eq 'TinnosDebloat-Win11') 'Unexpected product name.'
-            Assert (@($controls | Where-Object {$_ -is [Windows.Forms.CheckBox]}).Count -eq 4) 'Unexpected selection count.'
+            Assert (!@($controls | Where-Object {$_ -is [Windows.Forms.CheckBox] -or $_ -is [Windows.Forms.RadioButton]}).Count) 'Old app-action or Office toggles remain.'
+            Assert ('EQUIP GEAR' -in $controls.Text -and 'REMOVE WASPS' -in $controls.Text) 'Action headings missing.'
+            $gear=$form.Controls.Find('installList',$true)[0]
+            Assert ($gear.Items.Count -eq 3 -and $gear.CheckedItems.Count -eq 3) 'Equipment choices missing.'
             $choices=$form.Controls.Find('removalList',$true)[0]
             Assert ($choices.Items.Count -eq (Get-Content (Join-Path $root 'debloat-catalog.json') -Raw | ConvertFrom-Json).Count) 'Removal choices differ from the engine catalog.'
             Assert ($choices.CheckedItems.Count -lt $choices.Items.Count) 'High impact services must require selection.'
             $choices.SetItemChecked(0,$false)
-            Assert ($choices.GetItemChecked(0)) 'Mandatory Teams removal was disabled.'
+            Assert (!$choices.GetItemChecked(0)) 'Unchecked Teams cannot be kept.'
+            foreach($item in $choices.Items) {Assert ($item.ToString() -match '^(Uninstall|Deactivate|Hide|Enable) ') ('Ambiguous action label: '+$item)}
+            Assert ($form.Controls.Find('jadePendant',$true).Count -eq 1) 'Jade reference missing.'
+            for($i=0;$i -lt $choices.Items.Count;$i++) {$choices.SetItemChecked($i,$false)}
+            for($i=0;$i -lt $gear.Items.Count;$i++) {$gear.SetItemChecked($i,$false)}
+            $gear.SetItemChecked(0,$true)
+            $selected=$form.SelectedConfiguration() | ConvertFrom-Json
+            Assert ($selected.InstallItems.Count -eq 1 -and $selected.InstallItems[0] -eq 'GoogleDrive' -and $selected.RemoveItems.Count -eq 0) 'Unselected actions added to the configuration.'
+            Assert ($null -eq $selected.PSObject.Properties['IncludeAccess'] -and $null -eq $selected.PSObject.Properties['AppMode']) 'Removed configuration options still generated.'
             Assert ($form.Controls.Find('detailTabs',$true)[0].TabPages.Count -eq 2) 'Results tab remains.'
             $actions=@($controls | Where-Object {$_ -is [Windows.Forms.Button]})
             Assert ($actions.Count -eq 2 -and 'Start' -in $actions.Text -and 'Details' -in $actions.Text) 'Unexpected action buttons.'
             Assert (!@($controls | Where-Object {($_ -is [Windows.Forms.CheckBox] -or $_ -is [Windows.Forms.Button]) -and $_.Text -match 'PT-BR|English|Audit|reports'}).Count) 'Removed control still exists.'
-            $download=@($controls | Where-Object {$_ -is [Windows.Forms.RadioButton] -and $_.Text -eq 'Download only'})
-            $install=@($controls | Where-Object {$_ -is [Windows.Forms.RadioButton] -and $_.Text -eq 'Download + install'})
-            Assert ($download.Count -eq 1 -and $install.Count -eq 1 -and $download[0].Checked -and !$install[0].Checked) 'Download-only default missing.'
-            $install[0].Checked=$true
-            Assert (!$download[0].Checked) 'Install mode is not exclusive.'
-            $download[0].Checked=$true
-            Assert (!$install[0].Checked) 'Download mode cannot be restored.'
             Assert (!@($controls | Where-Object {$_ -is [Windows.Forms.ComboBox]}).Count) 'License or update dropdown remains.'
             Assert (!@($controls | Where-Object {$_.Text -match 'ODT|Browse|Enterprise'}).Count) 'Installer picker or Enterprise selection remains.'
         } finally {$form.Dispose()}
@@ -644,6 +842,27 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
             $text=$form.Controls.Find('errorDetails',$true)[0].Text
             Assert ([regex]::Matches($text,'\[TNO-500\]').Count -eq 1) 'Live error duplicated or lost on completion.'
         } finally {$form.Dispose()}
+    }
+    Test 'GUI startup works without console handles and startup failures reach the error handler' {
+        $probe=Join-Path $work 'StartupProbe.exe'
+        $compiler=Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+        $arguments=@('/nologo','/target:winexe','/platform:x64','/main:TinnosDebloat.StartupProbe',"/out:$probe",'/reference:System.Windows.Forms.dll','/reference:System.Drawing.dll','/reference:System.Web.Extensions.dll')
+        foreach($file in [TinnosDebloat.Payload]::Files) {$arguments+="/resource:$root\$file,Payload.$file"}
+        $arguments+=(Join-Path $root 'src\Program.cs');$arguments+=(Join-Path $root 'tests\StartupProbe.cs')
+        & $compiler @arguments
+        Assert ($LASTEXITCODE -eq 0) 'Startup fixture compilation failed.'
+        foreach($mode in @('normal','failure')) {
+            $evidence=Join-Path $work ("startup-$mode.txt")
+            $start=New-Object Diagnostics.ProcessStartInfo
+            $start.FileName=$probe;$start.Arguments=([TinnosDebloat.Payload]::Quote($evidence))+$(if ($mode -eq 'failure') {' --failure'} else {''})
+            $start.UseShellExecute=$false;$start.CreateNoWindow=$true
+            $process=New-Object Diagnostics.Process;$process.StartInfo=$start
+            try {
+                $null=$process.Start()
+                if (!$process.WaitForExit(10000)) {$process.Kill();throw 'Startup fixture did not open and close its invisible test window.'}
+                Assert ($process.ExitCode -eq 0 -and [IO.File]::ReadAllText($evidence) -eq 'PASS') ('Startup fixture failed: '+$mode)
+            } finally {$process.Dispose()}
+        }
     }
     Test 'EXE checksum sidecar matches the build' {
         $hash=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash

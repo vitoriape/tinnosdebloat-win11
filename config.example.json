@@ -5,10 +5,6 @@
                       "pt-br"
                   ],
     "Channel":  "Current",
-    "AppMode":  "Download",
-    "IncludeAccess":  false,
-    "ExcludeOneDrive":  true,
-    "ExcludeNewOutlook":  true,
     "RemoveItems":  [
                         "Teams",
                         "Clipchamp",
@@ -18,6 +14,7 @@
                         "Maps",
                         "GameBar",
                         "FeedbackHub",
+                        "PowerAutomate",
                         "ToDo",
                         "MoviesTV",
                         "News",
@@ -30,6 +27,10 @@
                         "Weather",
                         "SearchIndexing",
                         "XboxServices",
+                        "DellSupportAssist",
+                        "DellDigitalDelivery",
+                        "DellCustomerConnect",
+                        "ASUSGiftbox",
                         "AutoTimeZone",
                         "RemoteRegistry",
                         "PhoneService",
@@ -37,5 +38,10 @@
                         "TaskbarSearch",
                         "TaskbarWidgets",
                         "DarkMode"
-                    ]
+                    ],
+    "InstallItems":  [
+                         "Office",
+                         "Chrome",
+                         "GoogleDrive"
+                     ]
 }

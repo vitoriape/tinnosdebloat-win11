@@ -10,7 +10,7 @@ $script:ModuleRoot = $PSScriptRoot
 $script:OfficePolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Office\16.0\common\officeupdate'
 $script:BrowserPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
 $script:TeamNames = @('MSTeams', 'MicrosoftTeams')
-$script:RequiredApps = [ordered]@{ Word='WINWORD.EXE'; Excel='EXCEL.EXE'; PowerPoint='POWERPNT.EXE'; Outlook='OUTLOOK.EXE'; OneNote='ONENOTE.EXE' }
+$script:RequiredApps = [ordered]@{ Word='WINWORD.EXE'; Excel='EXCEL.EXE'; PowerPoint='POWERPNT.EXE'; OneNote='ONENOTE.EXE' }
 $script:Report = $null
 $script:DebloatCatalog = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'debloat-catalog.json')) | ConvertFrom-Json
 $script:ErrorCatalog = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'error-codes.json')) | ConvertFrom-Json
@@ -95,7 +95,7 @@ function Get-OfficeProductId([string]$LicenseEdition) {
 function Read-DeploymentConfig([string]$Path) {
     $inputConfig = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
     if ($null -eq $inputConfig -or $inputConfig -isnot [pscustomobject]) { throw (New-TinnosError 'TNO-100' 'Configuration must be a JSON object.') }
-    $allowed = @('LicenseEdition','Architecture','Languages','Channel','IncludeAccess','ExcludeOneDrive','ExcludeNewOutlook','AppMode','RemoveItems')
+    $allowed = @('LicenseEdition','Architecture','Languages','Channel','AppMode','InstallItems','RemoveItems')
     foreach ($property in $inputConfig.PSObject.Properties) {
         $key = $property.Name
         if ($key -notin $allowed) { throw "Unknown configuration field: $key" }
@@ -107,36 +107,32 @@ function Read-DeploymentConfig([string]$Path) {
     $languages = @(Get-Value $inputConfig 'Languages' @('pt-br'))
     if ($languages.Count -ne 1 -or $languages[0] -ne 'pt-br') { throw (New-TinnosError 'TNO-100' 'Office language is fixed to pt-br. Remove other languages from the configuration.') }
     $channel = Get-Value $inputConfig 'Channel' 'Current'
-    $appMode = Get-Value $inputConfig 'AppMode' 'Download'
+    $appMode = Get-Value $inputConfig 'AppMode' 'Install'
     if ($appMode -notin @('Download','Install')) { throw 'AppMode must be Download or Install.' }
     if ($channel -notin @('Current','MonthlyEnterprise','SemiAnnual','SemiAnnualPreview','CurrentPreview','BetaChannel')) { throw 'Unsupported Office channel.' }
-    foreach ($name in @('IncludeAccess','ExcludeOneDrive','ExcludeNewOutlook')) {
-        if ($null -ne $inputConfig.PSObject.Properties[$name] -and $inputConfig.$name -isnot [bool]) { throw "$name must be a JSON boolean." }
+    $installItems = @(Get-Value $inputConfig 'InstallItems' @('Office','Chrome','GoogleDrive'))
+    foreach ($id in $installItems) {
+        if ($id -isnot [string] -or $id -cnotin @('Office','Chrome','GoogleDrive')) {throw (New-TinnosError 'TNO-100' "Unknown installation selection: $id")}
     }
     $removeItems = @(Get-Value $inputConfig 'RemoveItems' @($script:DebloatCatalog | Where-Object {(Get-Value $_ 'DefaultSelected' $true)} | ForEach-Object {$_.Id}))
     foreach ($id in $removeItems) {
         if ($id -isnot [string] -or $id -cnotin @($script:DebloatCatalog.Id)) { throw (New-TinnosError 'TNO-100' "Unknown removal selection: $id") }
     }
-    $removeItems = @('Teams') + @($removeItems | Where-Object {$_ -ne 'Teams'} | Select-Object -Unique)
+    $removeItems = @($removeItems | Select-Object -Unique)
     [pscustomobject]@{
         LicenseEdition=$edition; ProductId=(Get-OfficeProductId $edition); Architecture=[string]$architecture
         Languages=@($languages | Select-Object -Unique); Channel=$channel
         AppMode=$appMode
+        InstallItems=@($installItems | Select-Object -Unique)
         RemoveItems=$removeItems
-        IncludeAccess=(Get-Value $inputConfig 'IncludeAccess' $false)
-        ExcludeOneDrive=(Get-Value $inputConfig 'ExcludeOneDrive' $true)
-        ExcludeNewOutlook=((Get-Value $inputConfig 'ExcludeNewOutlook' $true) -or 'NewOutlook' -in $removeItems)
+        IncludeAccess=$false; ExcludeOneDrive=$true; ExcludeNewOutlook=$true
     }
 }
 
 function Get-DesiredExclusions($Config, $Office) {
     # Keep exclusions for unrelated apps during an existing-install reconfiguration.
-    $excluded = @('Teams','Lync','Publisher') + @(Get-Value $Office 'ExcludedApps' @())
-    if (!$Config.IncludeAccess) { $excluded += 'Access' }
-    if ($Config.ExcludeOneDrive) { $excluded += 'Groove'; $excluded += 'OneDrive' }
-    if ($Config.ExcludeNewOutlook) { $excluded += 'OutlookForWindows' }
-    $required = @('Word','Excel','PowerPoint','Outlook','OneNote')
-    if ($Config.IncludeAccess) { $required += 'Access' }
+    $excluded = @('Teams','Lync','Publisher','Access','Groove','OneDrive','Outlook','OutlookForWindows') + @(Get-Value $Office 'ExcludedApps' @())
+    $required = @('Word','Excel','PowerPoint','OneNote')
     @($excluded | Where-Object { $_ -and $_ -notin $required } | Sort-Object -Unique)
 }
 
@@ -174,6 +170,8 @@ function Get-UninstallEntries([string]$Hive = 'HKLM:') {
                         Name=$entry.DisplayName; Key=$key.PSChildName; Version=(Get-Value $entry 'DisplayVersion')
                         WindowsInstaller=(Get-Value $entry 'WindowsInstaller' 0)
                         UninstallString=(Get-Value $entry 'UninstallString' '')
+                        QuietUninstallString=(Get-Value $entry 'QuietUninstallString' '')
+                        Publisher=(Get-Value $entry 'Publisher' '')
                         Scope=$Hive
                     }
                 }
@@ -220,7 +218,6 @@ function Test-OfficeMatches($Config, $Office) {
     if ($Office.Platform -ne "x$($Config.Architecture)") { return $false }
     if ($Office.Channel -notmatch [regex]::Escape($channelIds[$Config.Channel])) { return $false }
     foreach ($app in $script:RequiredApps.Keys) { if (!@(Get-Value $Office.Apps $app @()).Count) { return $false } }
-    if ($Config.IncludeAccess -and !@($Office.Apps.Access).Count) { return $false }
     foreach ($language in $Config.Languages) { if ($language -notin $Office.Languages) { return $false } }
     foreach ($app in @(Get-DesiredExclusions $Config $Office)) { if ($app -notin $Office.ExcludedApps) { return $false } }
     return $true
@@ -377,10 +374,11 @@ function Test-TeamsAbsent($Inventory) {
     return $true
 }
 
-function Invoke-Installer([string]$FilePath, [string]$Arguments, [int[]]$SuccessCodes = @(0,3010,1641)) {
+function Invoke-Installer([string]$FilePath, [string]$Arguments, [int[]]$SuccessCodes = @(0,3010,1641), [switch]$Interactive) {
     $task = [IO.Path]::GetFileName($FilePath)
     Send-DeploymentEvent 'Task' $task 'Installer running; remaining time is not provided by this installer.'
-    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WindowStyle Hidden -PassThru
+    $windowStyle = if ($Interactive) {'Normal'} else {'Hidden'}
+    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WindowStyle $windowStyle -PassThru
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $lastUpdate = 0
     try {
@@ -400,9 +398,14 @@ function Invoke-Installer([string]$FilePath, [string]$Arguments, [int[]]$Success
     return $exitCode
 }
 
-function Assert-Publisher([string]$Path, [ValidateSet('Microsoft','Google')][string]$Publisher) {
+function Assert-Publisher([string]$Path, [ValidateSet('Microsoft','Google','Dell','ASUS')][string]$Publisher) {
     $signature = Get-AuthenticodeSignature -LiteralPath $Path
-    if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch "O=$Publisher (Corporation|LLC|Inc\.)[, ]") {
+    $organization = switch ($Publisher) {
+        'Dell' {'O="?Dell(?:,? Inc\.?| Technologies,? Inc\.?| Products,? L\.?P\.?)"?(?:,|$)'}
+        'ASUS' {'O="?ASUSTeK COMPUTER INC\.?"?(?:,|$)'}
+        default {"O=$Publisher (Corporation|LLC|Inc\.)[, ]"}
+    }
+    if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch $organization) {
         throw (New-TinnosError 'TNO-303' "Invalid $Publisher Authenticode signature: $Path")
     }
 }
@@ -795,6 +798,7 @@ function New-ChromeAssociations([string]$Path) {
 }
 
 function Set-ChromeDefault([string]$Directory, $Evidence) {
+    if (@(Get-Value $Evidence 'Errors' @()).Count) {throw (New-TinnosError 'TNO-202' 'Central policy evidence is unreadable. Chrome was installed, but browser-default changes require administrator review.')}
     if (!(Test-Path -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\ChromeHTML')) { throw 'Machine ChromeHTML registration is missing.' }
     $target = Join-Path $Directory 'chrome-associations.xml'
     New-ChromeAssociations $target
@@ -848,8 +852,9 @@ function Get-OfficeActivation([string]$ProductId) {
 
 function Get-DeploymentChecks($Config, $Office, $Teams, $Policies, $Google, [string]$Directory, [string]$Mode = 'Audit', $Applications = @()) {
     $checks = @()
+    $installItems=@(Get-Value $Config 'InstallItems' @('Office','Chrome','GoogleDrive'))
+    $removeItems=@(Get-Value $Config 'RemoveItems' @())
     foreach ($app in $script:RequiredApps.Keys) { $checks += [pscustomobject]@{ Name=$app; Pass=(@(Get-Value $Office.Apps $app @()).Count -gt 0); Detail=@(Get-Value $Office.Apps $app @()) } }
-    if ($Config.IncludeAccess) { $checks += [pscustomobject]@{ Name='Access'; Pass=(@($Office.Apps.Access).Count -gt 0); Detail=$Office.Apps.Access } }
     $checks += [pscustomobject]@{ Name='Chrome'; Pass=(@($Google.Chrome).Count -gt 0); Detail=$Google.Chrome }
     $checks += [pscustomobject]@{ Name='GoogleDrive'; Pass=(@($Google.Drive).Count -gt 0); Detail=$Google.Drive }
     $checks += [pscustomobject]@{ Name='TeamsCompletelyAbsent'; Pass=(Test-TeamsAbsent $Teams); Detail=$Teams }
@@ -879,7 +884,34 @@ function Get-DeploymentChecks($Config, $Office, $Teams, $Policies, $Google, [str
         $check | Add-Member -NotePropertyName Required -NotePropertyValue $required
         $check | Add-Member -NotePropertyName Category -NotePropertyValue $(if ($isApp) {'Application'} else {'Cleanup'})
     }
+    # Scope validation to requested actions. Unchecked apps/services are never
+    # presented as successful removals or as failures of this run.
+    $checks=@($checks | Where-Object {
+        if ($_.Name -in @('TeamsCompletelyAbsent','NoTeamsMachineWideInstaller','NoTeamsProvisioning')) {'Teams' -in $removeItems}
+        elseif ($_.Name -eq 'TeamsPreventionPolicy') {'Office' -in $installItems -or 'Teams' -in $removeItems}
+        elseif ($_.Name -in @('Word','Excel','PowerPoint','OneNote','OfficeConfiguration','OfficeTeamsExcluded')) {'Office' -in $installItems}
+        elseif ($_.Name -in @('Chrome','ChromeDefaultPolicy')) {'Chrome' -in $installItems}
+        elseif ($_.Name -eq 'GoogleDrive') {'GoogleDrive' -in $installItems}
+        else {$true}
+    })
+    $checks+=[pscustomobject]@{Name='SelectedActions';Pass=$true;Required=$true;Category='Selection';Detail=[pscustomobject]@{InstallItems=$installItems;RemoveItems=$removeItems}}
     foreach ($app in $Applications) {
+        if ($app.Action -eq 'RemoveRdc') {
+            $pass=$false;$evidence=$app
+            try {$state=Get-RemoteDesktopConnectionState;$pass=!$state.Present -and $app.Status -ne 'Failed';$evidence=$state} catch {$evidence=[string]$_}
+            $checks+=[pscustomobject]@{Name='RemoteDesktopConnection';Pass=$pass;Required=$true;Category='Debloat';Detail=$evidence;ErrorCode='TNO-504'}
+            continue
+        }
+        if ($app.Action -eq 'RemoveDesktop') {
+            $pass=$false;$evidence=$app
+            try {
+                $native=Get-DesktopUtilityInventory $app.Name
+                $pass=!$native.Entries.Count -and !$native.Packages.Count -and !$native.Provisioned.Count -and $app.Status -ne 'Failed'
+                $evidence=$native
+            } catch {$evidence=[string]$_}
+            $checks+=[pscustomobject]@{Name=$app.Name;Pass=$pass;Required=$true;Category='Debloat';Detail=$evidence;ErrorCode='TNO-504'}
+            continue
+        }
         if ($app.Action -in @('Remove','Disable')) {
             $pass=$false; $evidence=$app
             try {
@@ -889,7 +921,7 @@ function Get-DeploymentChecks($Config, $Office, $Teams, $Policies, $Google, [str
                     $pass=!$remaining.Count -and !$provisioning.Count -and $app.Status -ne 'Failed'
                     $evidence=[pscustomobject]@{Packages=$remaining;Provisioned=$provisioning;Operation=$app}
                 } else {
-                    $service=Get-CimInstance Win32_Service -Filter "Name='$($app.Name)'" -ErrorAction Stop
+                    $service=Get-CimInstance Win32_Service -Filter "Name='$($app.Name)'" -ErrorAction Stop | Select-Object Name,StartMode,State
                     $pass=($null -eq $service -or ($service.StartMode -eq 'Disabled' -and $service.State -eq 'Stopped')) -and $app.Status -ne 'Failed'
                     $evidence=[pscustomobject]@{Service=$service;Operation=$app}
                 }
@@ -1014,17 +1046,115 @@ function Assert-ServicePolicy([string]$Name) {
 
 function Disable-SelectedService([string]$Name) {
     if ($Name -notin @($script:DebloatCatalog | ForEach-Object {$_.Services})) { throw (New-TinnosError 'TNO-100' 'Service changes are limited to the explicit catalog.') }
-    $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if ($null -eq $service) { return [pscustomobject]@{Status='NotPresent'} }
-    Assert-ServicePolicy $Name
     $previous = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
+    if ($null -eq $previous) { return [pscustomobject]@{Status='NotPresent'} }
+    $service = Get-Service -Name $Name -ErrorAction Stop
+    Assert-ServicePolicy $Name
     Send-DeploymentEvent 'Task' $Name "Disabling service (previous startup: $($previous.StartMode), state: $($previous.State))."
     # No Force: dependent services must not be stopped as collateral damage.
     if ($service.Status -ne 'Stopped') { Stop-Service -Name $Name -ErrorAction Stop }
+    $stopWatch=[Diagnostics.Stopwatch]::StartNew()
+    while ((Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop).State -ne 'Stopped') {
+        if ($stopWatch.Elapsed.TotalSeconds -ge 30) {throw (New-TinnosError 'TNO-502' "$Name has not stopped within 30 seconds. Startup was not changed; resolve the pending service stop and retry.")}
+        Send-DeploymentEvent 'Progress' $Name 'Waiting for the service to reach Stopped; dependent services are not force-stopped.'
+        Start-Sleep -Milliseconds 1000
+    }
     Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
     $current = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
     if ($current.StartMode -ne 'Disabled' -or $current.State -ne 'Stopped') { throw (New-TinnosError 'TNO-502' "$Name is not both stopped and disabled. Retry or use services.msc after resolving dependencies/policy.") }
     return [pscustomobject]@{Status='Disabled';PreviousStartMode=$previous.StartMode;PreviousState=$previous.State}
+}
+
+function Get-RemoteDesktopConnectionState {
+    $paths=@('System32','SysWOW64' | ForEach-Object {Join-Path $env:WINDIR "$_\mstsc.exe"} | Where-Object {Test-Path -LiteralPath $_ -ErrorAction Stop})
+    [pscustomobject]@{Present=($paths.Count -gt 0);Paths=$paths}
+}
+
+function Remove-RemoteDesktopConnection {
+    $state=Get-RemoteDesktopConnectionState
+    if (!$state.Present) {return [pscustomobject]@{Status='NotPresent'}}
+    $windows=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+    if ([int]$windows.CurrentBuildNumber -lt 22631) {throw (New-TinnosError 'TNO-504' 'Remote Desktop Connection removal requires Windows 11 23H2 or newer. The client was left intact.')}
+    if (@(Get-Process mstsc -ErrorAction SilentlyContinue).Count) {throw (New-TinnosError 'TNO-403' 'Close outgoing Remote Desktop Connection sessions before removing the client. No session was force-closed.')}
+    $client=Join-Path $env:WINDIR 'System32\mstsc.exe'
+    if (!(Test-Path -LiteralPath $client)) {throw (New-TinnosError 'TNO-504' 'The supported System32 mstsc.exe uninstaller is unavailable. Use Windows Installed apps.')}
+    Assert-Publisher $client 'Microsoft'
+    Send-DeploymentEvent 'Task' 'Remote Desktop Connection' 'Windows will show its own uninstall/restart prompt. Choose restart later so other tasks can finish. Saved RDP files are preserved.'
+    # Do not pass /noPromptBeforeRestart: Microsoft documents it as an automatic restart.
+    $null=Invoke-Installer $client '/uninstall' @(0,3010) -Interactive
+    if ((Get-RemoteDesktopConnectionState).Present) {
+        $message='Remote Desktop Connection removal is not yet verified. Complete the Windows prompt and restart if requested, then retry. No automatic restart was requested.'
+        $script:Report.Pending += $message
+        Add-RunIssue (New-DeploymentIssue 'TNO-504' $message 'Remote Desktop Connection' 'Pending')
+        return [pscustomobject]@{Status='Pending'}
+    }
+    return [pscustomobject]@{Status='Removed'}
+}
+
+function Get-DesktopUtilityInventory([string]$Id) {
+    $definition=@($script:DebloatCatalog | Where-Object {$_.Id -eq $Id -and (Get-Value $_ 'DesktopProducts')})
+    if ($definition.Count -ne 1) {throw (New-TinnosError 'TNO-100' 'Desktop removal is limited to catalog products.')}
+    $names=@($definition[0].DesktopProducts)
+    $entries=@(Get-UninstallEntries | Where-Object {$_.Name -in $names})
+    # Inspect per-user entries, but do not run another user's uninstaller elevated.
+    foreach ($profile in @(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object {!$_.Special})) {
+        $entries+=@(Use-ProfileHive $profile {param($Hive);Get-UninstallEntries $Hive | Where-Object {$_.Name -in $names}})
+    }
+    $packages=@();$provisioned=@()
+    foreach ($name in @(Get-Value $definition[0] 'DetectionPackages' @())) {
+        $packages+=@(Get-AppxPackage -AllUsers -Name $name -ErrorAction Stop | Where-Object {$_.Name -eq $name})
+        $provisioned+=@(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {$_.DisplayName -eq $name})
+    }
+    [pscustomobject]@{Entries=$entries;Packages=$packages;Provisioned=$provisioned;Definition=$definition[0]}
+}
+
+function Get-DesktopQuietCommand($Entry, [string]$Vendor) {
+    $quiet=[string](Get-Value $Entry 'QuietUninstallString' '')
+    $match=[regex]::Match($quiet, '^"([^"\r\n]+\.exe)"\s+([^\r\n]+)$|^(\S+\.exe)\s+([^\r\n]+)$', 'IgnoreCase')
+    if (!$match.Success) {throw (New-TinnosError 'TNO-504' "No supported silent uninstaller is registered for $($Entry.Name). Use Windows Installed apps.")}
+    $file=if ($match.Groups[1].Success) {$match.Groups[1].Value} else {$match.Groups[3].Value}
+    $arguments=if ($match.Groups[1].Success) {$match.Groups[2].Value} else {$match.Groups[4].Value}
+    if (![IO.Path]::IsPathRooted($file)) {throw (New-TinnosError 'TNO-504' 'The vendor uninstaller must use an absolute local path.')}
+    $file=[IO.Path]::GetFullPath($file)
+    $allowed=$false
+    foreach ($root in @($env:ProgramFiles,${env:ProgramFiles(x86)},$env:ProgramData) | Where-Object {$_}) {
+        if ([IO.Path]::IsPathRooted($file) -and $file.StartsWith(([IO.Path]::GetFullPath($root).TrimEnd('\')+'\'),[StringComparison]::OrdinalIgnoreCase)) {$allowed=$true}
+    }
+    if (!$allowed -or $file.StartsWith('\\')) {throw (New-TinnosError 'TNO-504' 'The registered vendor uninstaller is outside trusted local application directories.')}
+    for ($path=$file; $path; $path=Split-Path $path -Parent) {
+        if ((Get-Item -LiteralPath $path -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) {throw (New-TinnosError 'TNO-504' 'A redirected vendor uninstaller was rejected.')}
+    }
+    Assert-Publisher $file $Vendor
+    [pscustomobject]@{File=$file;Arguments=$arguments}
+}
+
+function Remove-DesktopUtility([string]$Id) {
+    $inventory=Get-DesktopUtilityInventory $Id
+    $definition=$inventory.Definition
+    if (!$inventory.Entries.Count -and !$inventory.Packages.Count -and !$inventory.Provisioned.Count) {return [pscustomobject]@{Status='NotPresent';ProductId=$Id}}
+    if (Get-Value $definition 'ManualUrl') {throw (New-TinnosError 'TNO-504' "Use the official ASUS uninstall tool for complete $Id removal, then reboot and retry. $($definition.ManualUrl)")}
+    $publisherPattern=switch ($definition.Vendor) {
+        'Dell' {'^Dell(?:,? Inc\.?| Technologies,? Inc\.?| Products,? L\.?P\.?)?$'}
+        'ASUS' {'^(?:ASUSTeK COMPUTER INC\.?|ASUS)$'}
+        'Microsoft' {'^Microsoft(?: Corporation)?$'}
+        default {throw (New-TinnosError 'TNO-100' 'Unknown desktop utility vendor.')}
+    }
+    foreach ($entry in $inventory.Entries) {
+        try {
+            if ($entry.Scope -ne 'HKLM:') {throw (New-TinnosError 'TNO-504' "Remove $($entry.Name) while signed into its owning user account. Its per-user uninstaller was not run as administrator.")}
+            if ((Get-Value $entry 'Publisher' '') -notmatch $publisherPattern) {throw (New-TinnosError 'TNO-504' "Publisher mismatch for $($entry.Name). Use the vendor's uninstaller manually.")}
+            Send-DeploymentEvent 'Task' $entry.Name 'Running the registered vendor uninstaller.'
+            if ($entry.WindowsInstaller -eq 1 -and $entry.Key -match '^\{[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\}$') {
+                $null=Invoke-Installer "$env:WINDIR\System32\msiexec.exe" "/x $($entry.Key) /qn /norestart" @(0,1605,1614,3010,1641)
+            } else {
+                $command=Get-DesktopQuietCommand $entry $definition.Vendor
+                $null=Invoke-Installer $command.File $command.Arguments @(0,1605,1614,3010,1641)
+            }
+        } catch {Add-RunIssue (New-DeploymentIssue 'TNO-504' $_.Exception.Message $entry.Name 'Error' $_)}
+    }
+    $remaining=Get-DesktopUtilityInventory $Id
+    if ($remaining.Entries.Count -or $remaining.Packages.Count -or $remaining.Provisioned.Count) {throw (New-TinnosError 'TNO-504' "$Id still has installed components. Review Errors, reboot if indicated, or uninstall manually.")}
+    return [pscustomobject]@{Status='Removed';ProductId=$Id}
 }
 
 function Assert-LocalDesktopSettings {
@@ -1082,56 +1212,78 @@ function Invoke-SelectedDebloat($Config, [string]$Directory) {
     $selectedItems=@($script:DebloatCatalog | Where-Object {$_.Id -in @(Get-Value $Config 'RemoveItems' @('Teams')) -and $_.Id -ne 'Teams'})
     $remaining=$selectedItems.Count
     foreach ($item in $selectedItems) {
-        Send-DeploymentEvent 'Task' 'Cleanup queue' "$remaining selected groups left to attempt. Current: $($item.Name). Office, Chrome and Drive follow cleanup."
+        Send-DeploymentEvent 'Task' 'Cleanup queue' "$remaining selected groups left to attempt. Current: $($item.Name). Only checked installation tasks follow cleanup."
         foreach ($package in $item.Packages) {
             Invoke-ApplicationStep $package 'Remove' { Remove-SelectedApp $package $Directory }
         }
         foreach ($service in $item.Services) {
             Invoke-ApplicationStep $service 'Disable' { Disable-SelectedService $service }
         }
+        if (Get-Value $item 'DesktopProducts') {Invoke-ApplicationStep $item.Id 'RemoveDesktop' {Remove-DesktopUtility $item.Id}}
+        if ((Get-Value $item 'WindowsApp') -eq 'RemoteDesktopConnection') {Invoke-ApplicationStep $item.Id 'RemoveRdc' {Remove-RemoteDesktopConnection}}
         if (Get-Value $item 'Setting') { Invoke-ApplicationStep $item.Name 'Configure' {Set-SelectedDesktopSetting $item.Setting} }
         $remaining--
     }
 }
 
 function Invoke-DeploymentSteps($Config, $Office, $Teams, $Policies, [string]$XmlPath, [string]$Directory) {
+    $installItems=@(Get-Value $Config 'InstallItems' @('Office','Chrome','GoogleDrive'))
+    $removeItems=@(Get-Value $Config 'RemoveItems' @())
+    Send-DeploymentEvent 'Task' 'Selected actions' ("Install: {0}. Remove/configure: {1}. Unchecked items will be left alone." -f ($installItems -join ', '),($removeItems -join ', '))
+    if (!$installItems.Count -and !$removeItems.Count) {Send-DeploymentEvent 'Success' 'Selection' 'Nothing selected; no system changes requested.';return}
     $script:Report.Steps += 'Create or verify a Windows restore point before deployment changes'
     $restoreOk = Invoke-MaintenanceStep 'Restore point' {$script:Report.RestorePoint = New-DeploymentRestorePoint} 'TNO-201'
-    $effectiveConfig = $Config.PSObject.Copy()
     if (!$restoreOk) {
-        $effectiveConfig.AppMode='Download'
-        Send-DeploymentEvent 'Task' 'Recovery' 'Restore point unavailable. Skipping all system changes; independent app downloads will continue.'
+        Send-DeploymentEvent 'Task' 'Recovery' 'Restore point unavailable. Selected system changes were skipped; resolve the restore-point error and retry.'
+        return
     }
-    $teamsOk=$false; $policyOk=$false
-    if ($restoreOk) {
+    $teamsSelected='Teams' -in $removeItems
+    $teamsOk=!$teamsSelected; $policyOk=$false
+    if ($teamsSelected) {
     $script:Report.Steps += '2 Remove Teams applications and machine-wide installers'
     $dataSafe = Invoke-MaintenanceStep 'Teams applications' {Remove-TeamsApplications $Teams $Config $Directory} 'TNO-203'
     $script:Report.Steps += '3 Remove Teams provisioned packages'
     if ($dataSafe) {$null=Invoke-MaintenanceStep 'Teams provisioning' {Remove-TeamsProvisioning $Teams} 'TNO-203'}
     else {Send-DeploymentEvent 'Task' 'Teams provisioning' 'Skipped because Teams data preservation/removal could not be completed.'}
-    $script:Report.Steps += '4 Configure supported Teams prevention policy'
-    $policyOk=Invoke-MaintenanceStep 'Teams prevention policy' {Set-TeamsPrevention $Policies} 'TNO-202'
     # User-context tasks may finish after this process. Never install Office ahead
     # of unresolved per-profile removal, even with Teams excluded in the XML.
-    if ($Config.AppMode -eq 'Install') {$teamsOk=Invoke-MaintenanceStep 'Verify Teams removal' {Assert-TeamsRemovalComplete} 'TNO-203'}
-    $null=Invoke-MaintenanceStep 'Selected app and service cleanup' {Invoke-SelectedDebloat $Config $Directory} 'TNO-500'
     }
+    if ('Office' -in $installItems -or $teamsSelected) {
+    $script:Report.Steps += '4 Configure supported Teams installation-prevention policy'
+    $policyOk=Invoke-MaintenanceStep 'Teams prevention policy' {Set-TeamsPrevention $Policies} 'TNO-202'
+    if ($teamsSelected -and 'Office' -in $installItems -and $Config.AppMode -eq 'Install') {$teamsOk=Invoke-MaintenanceStep 'Verify Teams removal' {Assert-TeamsRemovalComplete} 'TNO-203'}
+    }
+    if ($removeItems.Count) {$null=Invoke-MaintenanceStep 'Selected app and service cleanup' {Invoke-SelectedDebloat $Config $Directory} 'TNO-500'}
+    if ('Office' -in $installItems) {
     $script:Report.Steps += "5 $($Config.AppMode) Microsoft 365 Apps with ODT and Teams excluded"
-    Invoke-ApplicationStep 'Office' $effectiveConfig.AppMode {
-        if ($effectiveConfig.AppMode -eq 'Install' -and (!$teamsOk -or !$policyOk)) { throw (New-TinnosError 'TNO-203' 'Office installation skipped until Teams removal and prevention policy are verified. Chrome and Drive will continue.') }
-        Install-Office $effectiveConfig $Office $Policies $XmlPath $Directory
+    Invoke-ApplicationStep 'Office' $Config.AppMode {
+        if ($Config.AppMode -eq 'Install' -and (!$teamsOk -or !$policyOk)) { throw (New-TinnosError 'TNO-203' 'Office installation skipped until selected Teams removal and prevention policy are verified. Other selected installations will continue.') }
+        Install-Office $Config $Office $Policies $XmlPath $Directory
     }
+    if ($Config.AppMode -eq 'Install' -and @($script:Report.Applications | Where-Object {$_.Name -eq 'Office' -and $_.Status -in @('Installed','AlreadyInstalled')}).Count) {
+        $postOffice=$Config.PSObject.Copy()
+        $postOffice.RemoveItems=@($removeItems | Where-Object {$_ -in @('Copilot','NewOutlook')})
+        if ($postOffice.RemoveItems.Count) {
+            Send-DeploymentEvent 'Task' 'Post-Office cleanup' 'Rechecking selected Copilot and new Outlook packages after Office installation.'
+            $null=Invoke-MaintenanceStep 'Post-Office selected removals' {Invoke-SelectedDebloat $postOffice $Directory} 'TNO-500'
+        }
+    }
+    }
+    if ('Chrome' -in $installItems) {
     $script:Report.Steps += "6 $($Config.AppMode) Google Chrome"
-    Invoke-ApplicationStep 'Chrome' $effectiveConfig.AppMode { Install-GoogleChrome $Directory -DownloadOnly:($effectiveConfig.AppMode -eq 'Download') }
+    Invoke-ApplicationStep 'Chrome' $Config.AppMode { Install-GoogleChrome $Directory -DownloadOnly:($Config.AppMode -eq 'Download') }
+    }
+    if ('GoogleDrive' -in $installItems) {
     $script:Report.Steps += "7 $($Config.AppMode) Google Drive for desktop"
-    Invoke-ApplicationStep 'GoogleDrive' $effectiveConfig.AppMode { Install-GoogleDrive $Directory -DownloadOnly:($effectiveConfig.AppMode -eq 'Download') }
-    if ($effectiveConfig.AppMode -eq 'Install') {
+    Invoke-ApplicationStep 'GoogleDrive' $Config.AppMode { Install-GoogleDrive $Directory -DownloadOnly:($Config.AppMode -eq 'Download') }
+    }
+    if ($Config.AppMode -eq 'Install' -and 'Chrome' -in $installItems) {
         $script:Report.Steps += '8 Configure Chrome defaults with supported Windows mechanisms'
         Invoke-ApplicationStep 'ChromeDefaults' 'Configure' {
             if (!@((Get-GoogleApps).Chrome).Count) {throw (New-TinnosError 'TNO-404' 'Chrome defaults skipped because Chrome is not installed.')}
             Set-ChromeDefault $Directory $Policies; [pscustomobject]@{Status='Configured'}
         }
-    } else { $script:Report.Notes += 'Browser defaults skipped: download-only mode or Chrome is not installed.' }
+    }
 }
 
 function Invoke-ApplicationStep([string]$Name, [string]$Action, [scriptblock]$Operation) {
@@ -1139,13 +1291,13 @@ function Invoke-ApplicationStep([string]$Name, [string]$Action, [scriptblock]$Op
     try {
         $result = & $Operation
         $status = Get-Value $result 'Status'
-        if ($status -notin @('Downloaded','Installed','AlreadyInstalled','Configured','Removed','Disabled','NotPresent')) { throw (New-TinnosError 'TNO-405' 'The app operation returned no confirmed result.') }
+        if ($status -notin @('Downloaded','Installed','AlreadyInstalled','Configured','Removed','Disabled','NotPresent','Pending')) { throw (New-TinnosError 'TNO-405' 'The app operation returned no confirmed result.') }
         $script:Report.Applications += [pscustomobject]@{Name=$Name;Action=$Action;Status=$status;Detail=$result;Error=$null}
-        Send-DeploymentEvent 'Success' $Name $status
+        Send-DeploymentEvent $(if ($status -eq 'Pending') {'Task'} else {'Success'}) $Name $status
     } catch {
         $message = "$Name $Action failed and was skipped: $($_.Exception.Message)"
         $script:Report.AppIssues += $message
-        $defaultCode = if ($Action -eq 'Remove') {'TNO-500'} elseif ($Action -eq 'Disable') {'TNO-502'} else {'TNO-404'}
+        $defaultCode = if ($Action -eq 'Remove') {'TNO-500'} elseif ($Action -in @('RemoveDesktop','RemoveRdc')) {'TNO-504'} elseif ($Action -eq 'Disable') {'TNO-502'} else {'TNO-404'}
         $issue = New-DeploymentIssue $defaultCode $_.Exception.Message $Name 'Error' $_
         Add-RunIssue $issue
         $script:Report.Applications += [pscustomobject]@{Name=$Name;Action=$Action;Status='Failed';Detail=$null;Error=$_.Exception.Message;ErrorCode=$issue.Code}
@@ -1197,6 +1349,27 @@ function New-DeploymentRestorePoint {
     }
 }
 
+function Get-ScopedDeploymentInventory($Config, [string]$Phase) {
+    $install=@(Get-Value $Config 'InstallItems' @('Office','Chrome','GoogleDrive'));$remove=@(Get-Value $Config 'RemoveItems' @())
+    $office=[pscustomobject]@{InventoryAvailable=$false;Present=$false;ProductIds=@();Platform='';Channel='';ExcludedApps=@();Languages=@();Apps=[pscustomobject]@{};OtherOffice=@()}
+    $teams=[pscustomobject]@{Errors=@();Packages=@();Provisioned=@();MachineEntries=@();MachineBinaries=@();MachineStartup=@();MachineShortcuts=@();MachineAddinFiles=@();Profiles=@()}
+    $policies=[pscustomobject]@{Errors=@();Conflicts=@();PreventTeamsInstall=$null;UpdatePolicies=@();Evidence=@();DomainJoined=$false}
+    $google=[pscustomobject]@{Chrome=@();Drive=@()}
+    if ('Office' -in $install) {
+        try {$office=Get-OfficeState $Config} catch {Add-RunIssue (New-DeploymentIssue 'TNO-200' $_.Exception.Message "$Phase Office inventory" 'Error' $_)}
+    }
+    if ('Teams' -in $remove) {
+        try {$teams=Get-TeamsInventory} catch {$teams.Errors=@([string]$_);Add-RunIssue (New-DeploymentIssue 'TNO-200' $_.Exception.Message "$Phase Teams inventory" 'Error' $_)}
+    }
+    if ('Teams' -in $remove -or 'Office' -in $install -or 'Chrome' -in $install) {
+        try {$policies=Get-PolicyEvidence} catch {$policies.Errors=@([string]$_);Add-RunIssue (New-DeploymentIssue 'TNO-202' $_.Exception.Message "$Phase policy inventory" 'Error' $_)}
+    }
+    if ($Phase -eq 'After' -and ('Chrome' -in $install -or 'GoogleDrive' -in $install)) {
+        try {$google=Get-GoogleApps} catch {Add-RunIssue (New-DeploymentIssue 'TNO-200' $_.Exception.Message 'Google application inventory' 'Error' $_)}
+    }
+    [pscustomobject]@{Office=$office;Teams=$teams;Policies=$policies;Google=$google}
+}
+
 function Assert-ProvisioningHost {
     if (![Environment]::Is64BitProcess) { throw (New-TinnosError 'TNO-102' 'Run 64-bit Windows PowerShell 5.1, including from 32-bit management agents via Sysnative.') }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -1219,21 +1392,11 @@ function Invoke-CorporateProvisioning([string]$ConfigPath, [ValidateSet('Audit',
         try {
             $script:Report.Steps += '1 Detect existing Office and Teams'
             Send-DeploymentEvent 'Task' 'Inventory' 'Detecting Office, Teams and policy settings.'
-            try {$office=Get-OfficeState $config} catch {
-                $office=[pscustomobject]@{InventoryAvailable=$false;Present=$false;ProductIds=@();Platform='';Channel='';ExcludedApps=@();Languages=@();Apps=[pscustomobject]@{};OtherOffice=@()}
-                Add-RunIssue (New-DeploymentIssue 'TNO-200' $_.Exception.Message 'Office inventory' 'Error' $_)
-            }
-            try {$teams=Get-TeamsInventory} catch {
-                $teams=[pscustomobject]@{Errors=@([string]$_);Packages=@();Provisioned=@();MachineEntries=@();MachineBinaries=@();MachineStartup=@();MachineShortcuts=@();MachineAddinFiles=@();Profiles=@()}
-                Add-RunIssue (New-DeploymentIssue 'TNO-200' $_.Exception.Message 'Teams inventory' 'Error' $_)
-            }
-            try {$policies=Get-PolicyEvidence} catch {
-                $policies=[pscustomobject]@{Errors=@([string]$_);Conflicts=@();PreventTeamsInstall=$null;UpdatePolicies=@();Evidence=@();DomainJoined=$true}
-                Add-RunIssue (New-DeploymentIssue 'TNO-202' $_.Exception.Message 'Policy inventory' 'Error' $_)
-            }
+            $before=Get-ScopedDeploymentInventory $config 'Before'
+            $office=$before.Office;$teams=$before.Teams;$policies=$before.Policies
             $script:Report.Before = [pscustomobject]@{ Office=$office; Teams=$teams; Policies=$policies }
             $xmlPath = Join-Path $directory 'office-configuration.xml'
-            $null=Invoke-MaintenanceStep 'Office configuration' {$null=New-OfficeConfiguration $config $office $xmlPath} 'TNO-100'
+            if ('Office' -in $config.InstallItems) {$null=Invoke-MaintenanceStep 'Office configuration' {$null=New-OfficeConfiguration $config $office $xmlPath} 'TNO-100'}
             if ($Mode -eq 'Deploy') {
                 Invoke-DeploymentSteps $config $office $teams $policies $xmlPath $directory
             }
@@ -1246,15 +1409,20 @@ function Invoke-CorporateProvisioning([string]$ConfigPath, [ValidateSet('Audit',
         $script:Report.Steps += '9 Validate application results, Teams absence and policies; activation deferred'
         Send-DeploymentEvent 'Task' 'Final verification' 'Checking applications, selected removals, services and policies.'
         try {
-            $office = Get-OfficeState $config; $teams = Get-TeamsInventory; $policies = Get-PolicyEvidence; $google = Get-GoogleApps
-            Get-UserCleanupResults $teams -RemoveCompleted:($Mode -eq 'Deploy')
+            $after=Get-ScopedDeploymentInventory $config 'After'
+            $office=$after.Office;$teams=$after.Teams;$policies=$after.Policies;$google=$after.Google
+            if ('Teams' -in $config.RemoveItems) {Get-UserCleanupResults $teams -RemoveCompleted:($Mode -eq 'Deploy')}
             $script:Report.RebootReasons = @(Get-PendingRebootReasons)
             if ($script:Report.RebootReasons.Count) { $script:Report.RebootRequired = $true }
             $script:Report.After = [pscustomobject]@{ Office=$office; Teams=$teams; Policies=$policies; Google=$google }
             $script:Report.Checks = @(Get-DeploymentChecks $config $office $teams $policies $google $directory $Mode $script:Report.Applications)
-            $script:Report.Errors += @($teams.Errors) + @($policies.Errors) + @($policies.Conflicts)
-            foreach ($message in @($teams.Errors) + @($policies.Errors)) { Add-RunIssue (New-DeploymentIssue 'TNO-200' $message 'Inventory') }
-            foreach ($message in $policies.Conflicts) { Add-RunIssue (New-DeploymentIssue 'TNO-202' $message 'Policy') }
+            $script:Report.Errors += @($teams.Errors)
+            foreach ($message in @($teams.Errors)) { Add-RunIssue (New-DeploymentIssue 'TNO-200' $message 'Inventory') }
+            if ('Office' -in $config.InstallItems -or 'Teams' -in $config.RemoveItems) {
+                $script:Report.Errors += @($policies.Errors) + @($policies.Conflicts)
+                foreach ($message in $policies.Errors) {Add-RunIssue (New-DeploymentIssue 'TNO-200' $message 'Policy inventory')}
+                foreach ($message in $policies.Conflicts) { Add-RunIssue (New-DeploymentIssue 'TNO-202' $message 'Policy') }
+            }
             $script:Report.Activation = [pscustomobject]@{Status='Deferred';Reason='No sign-in, activation or license-status query attempted. An employee may activate Office later using their licensed account.'}
             if ($Mode -eq 'Deploy' -and $config.AppMode -eq 'Install') {
                 foreach ($check in @($script:Report.Checks | Where-Object {$_.Category -eq 'Application' -and !$_.Pass})) {
@@ -1265,7 +1433,9 @@ function Invoke-CorporateProvisioning([string]$ConfigPath, [ValidateSet('Audit',
             $script:Report.Status = Get-DeploymentStatus $script:Report.Checks $script:Report.Errors $script:Report.RebootRequired $script:Report.Pending $script:Report.AppIssues
             if ($Mode -eq 'Plan' -and !$script:Report.Errors.Count) { $script:Report.Status = 'Planned' }
         } catch { $script:Report.Errors += "Validation: $_"; $script:Report.Status = 'Failed'; Add-RunIssue (New-DeploymentIssue 'TNO-200' $_.Exception.Message 'Validation' 'Error' $_) }
-        foreach ($message in $script:Report.Pending) { Add-RunIssue (New-DeploymentIssue 'TNO-203' $message 'Cleanup' 'Pending') }
+        foreach ($message in $script:Report.Pending) {
+            if ($message -notlike 'Remote Desktop Connection removal*') {Add-RunIssue (New-DeploymentIssue 'TNO-203' $message 'Cleanup' 'Pending')}
+        }
         foreach ($task in $script:Report.UserCleanup) {
             if ($task.LastTaskResult -notin @(0,3010,267009,267011) -and @($script:Report.Pending | Where-Object {$_ -like "*$($task.TaskName)*"}).Count) { Add-RunIssue (New-DeploymentIssue 'TNO-206' "Cleanup task $($task.TaskName) returned $($task.LastTaskResult)." 'User cleanup' 'Pending') }
         }

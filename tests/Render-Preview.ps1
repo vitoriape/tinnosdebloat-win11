@@ -19,7 +19,7 @@ try {
         $form.ApplyEvent('{"Kind":"Success","Task":"Chrome (example)","Message":"Installed and verified"}')
         $form.ApplyEvent('{"Kind":"Progress","Task":"Google Drive (example)","Message":"Installer running. Elapsed: 00:30. Remaining time: unavailable."}')
         $form.Controls.Find('detailsButton',$true)[0].PerformClick()
-    } else {$form.Controls.Find('cleanupToggle',$true)[0].Checked=$true}
+    }
     [Windows.Forms.Application]::DoEvents(); $form.PerformLayout()
     $bitmap=New-Object Drawing.Bitmap($form.Width,$form.Height)
     $form.DrawToBitmap($bitmap,(New-Object Drawing.Rectangle(0,0,$form.Width,$form.Height)))

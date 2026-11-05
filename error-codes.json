@@ -30,6 +30,8 @@
   "TNO-501": { "Title": "Selected app data could not be preserved", "Action": "Unlock or attach the profile and back up app data before retrying. No removal of this app was started." },
   "TNO-502": { "Title": "Service could not be disabled", "Action": "Review dependencies and policy in services.msc. No dependent services are force-stopped." },
   "TNO-503": { "Title": "Desktop or taskbar setting incomplete", "Action": "Check the Windows edition and policy, sign out and back in, then retry or use Windows Settings." },
+  "TNO-504": { "Title": "Desktop utility removal incomplete", "Action": "Use the indicated vendor uninstaller or Windows Installed apps, then retry. Drivers and recovery files are not force-deleted." },
+  "TNO-905": { "Title": "Application window could not open", "Action": "Use the latest complete executable and report the startup dialog message." },
   "TNO-900": { "Title": "Unexpected engine error", "Action": "Review Details and report the code and message to the project maintainer." },
   "TNO-901": { "Title": "Launcher could not start", "Action": "Check working-directory access, executable integrity and Windows PowerShell availability." },
   "TNO-902": { "Title": "Script execution blocked", "Action": "Use organization-approved script signing or policy settings; central policy is not overridden." },

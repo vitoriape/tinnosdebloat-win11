@@ -4,7 +4,7 @@ Windows 11 cleanup and workstation provisioning, with a restore point before dep
 
 <div align="center">
 
-![version](https://img.shields.io/badge/version-2.3.0-dab467.svg)
+![version](https://img.shields.io/badge/version-2.4.0-dab467.svg)
 ![status](https://img.shields.io/badge/status-preview-64748b.svg)
 ![platform](https://img.shields.io/badge/Windows_11-x64-0078D4.svg)
 ![launcher](https://img.shields.io/badge/C%23-WinForms-512BD4.svg)
@@ -37,8 +37,8 @@ Windows 11 cleanup and workstation provisioning, with a restore point before dep
 ## 📄 Description
 
 **TinnosDebloat-Win11** prepares an existing Windows 11 installation for work. It
-removes Microsoft Teams, downloads Microsoft 365 Apps for Business, Chrome and
-Google Drive, and checks the resulting state. App installation is optional; a
+installs selected Microsoft 365 Apps for Business, Chrome and Google Drive, removes
+selected unwanted apps and disables selected services, then checks the resulting state. A
 failed app is reported and skipped while the others continue. It works on the running Windows
 installation; no Windows reinstall or custom image is needed.
 
@@ -60,14 +60,15 @@ shared frameworks and personal documents are preserved.
 | Component | Behavior |
 | --- | --- |
 | Microsoft 365 Apps for Business | Official ODT, `O365BusinessRetail`, 64-bit, Current Channel |
-| Word, Excel, PowerPoint, classic Outlook, OneNote | Included in Office media; verified on the device when installation is selected |
-| Access | Optional selection |
-| Teams | Always excluded; new, classic, personal, machine-wide and provisioned variants checked |
-| OneDrive | Excluded from Office when selected; existing standalone OneDrive and its documents are preserved |
-| New Outlook | Removed when selected in the checklist and excluded from Office; classic Outlook remains required |
+| Word, Excel, PowerPoint, OneNote | Included in Office; verified when Office installation is selected |
+| Access, OneDrive, classic and new Outlook | Always excluded from the Office deployment; existing standalone products/documents are not force-deleted |
+| Teams | Always excluded from Office; Teams removal runs only when its Uninstall entry is checked |
+| New Outlook | Its Windows Store package is removed only when the corresponding Uninstall entry is checked |
 | Chrome | Official Google Enterprise MSI; browser associations configured only in Install mode |
 | Google Drive for desktop | Official installer; no Docs/Sheets/Slides shortcuts or requested desktop shortcut |
-| Built-in apps and services | Expandable removal checklist; exact packages/services, independent steps and final checks |
+| Built-in apps and services | REMOVE WASPS checklist; exact packages/services, independent steps and final checks |
+| Power Automate, Feedback Hub and Xbox Live | Store/desktop Power Automate selection; Feedback Hub and Xbox apps/services are covered by the existing selections |
+| Dell / ASUS utilities | Specific utility selections and registered uninstallers; hardware drivers and shared core services are preserved |
 | Desktop and taskbar | Hide desktop icons without deleting files; hide search and Widgets news/weather |
 | Dark mode | Windows and app theme preferences for existing local user profiles |
 
@@ -97,38 +98,34 @@ Git, Python, a development SDK, or this source repository.
 
 ### Interface selections
 
-The window groups selections into **App action** and **Office options**.
-Office is always **Microsoft 365 Apps for Business, PT-BR, 64-bit**.
-The only action buttons are **Start** and **Details**.
+The screen has two always-visible lists. **Checked means execute the named
+action. Unchecked means leave it alone.** Start executes the selected actions;
+Details shows the live Log and Errors. There is no App Action mode selector or
+Office-options panel. A small jade pendant in the upper-right corner is a visual
+reference to the game's artifacts.
 
-| Button | Default | Meaning |
+| List | Entries | What checking means |
 | --- | --- | --- |
-| Download only | Selected | Save app installers/media without installing the apps or changing browser defaults |
-| Download + install | Off | Download app files and attempt silent installation |
-| Include Access | Off | Include Microsoft Access |
-| Exclude OneDrive | Selected | Exclude OneDrive from the Office deployment |
-| Exclude new Outlook | Selected | Exclude the new Outlook app from Office |
+| **EQUIP GEAR** | Install Google Drive, Install Microsoft 365 Office, Install Google Chrome | Download the official installer and install the selected application |
+| **REMOVE WASPS** | Uninstall (app), Deactivate (service), Hide (UI item), Enable dark mode | Execute exactly the action named on that line |
 
-Gold selections are enabled. Office language is fixed to Portuguese (Brazil);
-there is no language selector. The Office edition, Teams exclusion, 64-bit
-architecture and restore-point step are automatic.
-The GUI uses Current Channel; administrators can select another supported update
-channel in JSON for command-line deployment.
+Office is fixed to **Business, PT-BR, 64-bit, Current Channel**, including Word,
+Excel, PowerPoint and OneNote. Teams, OneDrive, Access, classic Outlook and new
+Outlook are always excluded from the Office configuration. No license sign-in or
+activation is attempted. Unchecking Office leaves the existing Office installation
+alone. An already installed standalone OneDrive or Outlook product is not removed
+merely by excluding it from a new Office deployment.
 
-Leave **Download only** selected to save the files, or choose **Download + install**
-to attempt silent app installation. These modes are mutually exclusive. **Start**
-runs the selected action. **Details** expands the **Log** and **Errors** tabs.
-Teams cleanup and restore-point handling still run with either action;
-Download only applies to Office, Chrome and Drive, not to cleanup.
-An app download/install error never cancels attempts for the remaining apps.
-
-Expand **Choose apps, services and desktop settings** to review the removal
-checklist before Start. Teams removal remains required. The supplied config selects
-the listed built-in apps, search indexing, Xbox background services, desktop/taskbar
-settings and dark mode. Higher impact services such as BitLocker management,
-biometrics, Smart Card, Server/SMB and Remote Desktop start unchecked.
-Read their effects in [the checklist reference](docs/DEBLOAT.md) before selecting.
-Selections are saved in the run's working configuration as `RemoveItems` IDs;
+All removal entries, including Teams, can be unchecked. No selected actions means
+Start performs no deployment. The supplied defaults select the built-in app
+removals, common background-service changes, desktop/taskbar settings and dark
+mode. Higher impact services such as BitLocker management, biometrics, Smart Card,
+Server/SMB, Remote Desktop Services and the Remote Desktop Connection client start
+unchecked. Read [the checklist reference](docs/DEBLOAT.md) before selecting them.
+Dell SupportAssist, Digital Delivery, Customer Connect and ASUS GIFTBOX are included
+in the defaults. Dell Optimizer, recovery helpers, MyASUS and Armoury Crate require
+explicit selection because they can affect device settings or OEM recovery.
+Selections are saved in the run's working configuration as `InstallItems` and `RemoveItems` IDs;
 the supplied `config.example.json` shows the same defaults as the interface.
 
 ![Live task details (illustrative events, no installation)](docs/interface-details.png)
@@ -174,12 +171,18 @@ shortcuts left by earlier installations. Hiding desktop icons leaves those files
 
 1. Copy [tinnosdebloat-win11.exe](tinnosdebloat-win11.exe?raw=true) to the target device.
 2. Open it and approve the Windows administrator request.
-3. Choose the app action and optional Office components. Office language is always PT-BR.
-4. Select **Start** to run cleanup and the chosen download/install action.
+3. Select what to install under EQUIP GEAR and what to uninstall/deactivate under REMOVE WASPS.
+4. Select **Start**. Only selected actions run; Office language is always PT-BR.
 5. Select **Details** for the live Log and Errors tabs. The status line follows the current task.
 
 Opening the app does not deploy anything. Closing is blocked while an operation
 is running, so installers are not interrupted by closing the window.
+
+Version 2.3.1 fixes console-encoding initialization on the GUI startup path. A
+normal Windows Explorer launch has no console; the window no longer depends on
+one. If window creation fails, an English `TNO-905` dialog shows the exception
+instead of silently failing. Replace older copies on USB drives or target devices
+with the rebuilt executable from this version.
 
 The executable is unsigned. Sign release binaries and scripts with your normal
 publisher certificate where managed distribution requires it. This build has been
@@ -210,8 +213,15 @@ line; the GUI has no Audit button. Plan generates XML without deploying software
 The Business product and `"Languages": ["pt-br"]` are fixed; other languages,
 unknown fields, license keys and custom installer URLs are rejected.
 
-`"AppMode": "Download"` is the default. Set `"AppMode": "Install"` to attempt app
-installation. Office download mode runs ODT `/download` and verifies the media;
+`InstallItems` accepts `Office`, `Chrome` and `GoogleDrive`; an empty array skips
+all installs. `RemoveItems` accepts the IDs in `debloat-catalog.json`; an empty
+array skips all removals and preferences. Both empty arrays request no changes.
+The GUI and default configuration install selected apps. The legacy Office flags
+`IncludeAccess`, `ExcludeOneDrive` and `ExcludeNewOutlook` are no longer accepted;
+use the updated sample configuration.
+
+Advanced command-line users can still set `"AppMode": "Download"` explicitly;
+the default is `Install`. Office download mode runs ODT `/download` and verifies the media;
 it never runs `/configure`. Office data is saved under `OfficeMedia`, and Chrome
 and Drive installers are saved beside the generated Office XML. If moving Office
 media to another folder or device for later installation, update the XML's absolute
@@ -243,10 +253,10 @@ Windows normally limits `Checkpoint-Computer` to one point per day. If Windows
 explicitly throttles creation, a verified point less than 24 hours old can be
 used, recording `ReusedRecent`, its sequence and timestamp. That older point does
 not represent the exact state immediately before this run. A fresh point is
-reported as `Created`. If neither is available, system changes are skipped and the
-error appears immediately. Independent app downloads can continue, including when
-Download + install was selected; no application installation or debloat mutation
-is attempted without the restore-point prerequisite.
+reported as `Created`. If neither is available, selected system changes are skipped
+and the error appears immediately. There is no automatic download fallback for an
+installation request; resolve the prerequisite and retry. Empty selections do not
+create a restore point.
 
 Restore points are not backups of personal documents. Before Teams uninstall,
 known local Teams data stores are separately copied to an administrator/SYSTEM-only
@@ -261,23 +271,16 @@ other selections continue. Detached profile containers must be attached to be co
 
 ```mermaid
 flowchart TD
-    A[Open portable EXE] --> B[Select options]
-    B --> C{Action}
-    C -->|Audit / Plan| D[Inventory and report]
-    C -->|Start| E[Inventory current device]
+    A[Select EQUIP GEAR and REMOVE WASPS] --> B[Start]
+    B --> C{Any action selected?}
+    C -->|No| D[No changes]
+    C -->|Yes| E[Inventory requested components]
     E --> F[Create or verify restore point]
-    F --> G[Preserve Teams data]
-    G --> H[Remove Teams apps and provisioning]
-    H --> I[Configure installation prevention]
-    I --> Q{App mode}
-    Q -->|Download| L[Download apps / optionally install]
-    Q -->|Install| J{Teams fully removed?}
-    J -->|Pending| K[Skip Office install; continue independent tasks]
-    J -->|Yes| L
-    L --> M[Record each app; continue after app errors]
-    M --> N[Configure browser associations in Install mode]
-    N --> O[Validate app results, profiles and policies]
-    O --> P[Live Log and Errors inside the application]
+    F --> G[Preserve data and run selected cleanup]
+    G --> H[Install selected gear; continue independent tasks after errors]
+    H --> I[Recheck selected Copilot and new Outlook removals after Office]
+    I --> J[Validate selected apps and stopped/disabled services]
+    J --> K[Live Log and Errors]
 ```
 
 Matching Office installations are skipped. Product, bitness, apps, languages,
@@ -286,8 +289,8 @@ central update-policy conflicts require administrator remediation. Documents and
 applications are not force-closed.
 
 Matching-install checks apply only to Install mode. Download mode can prepare
-Office media regardless of the installed Office edition. Pending Teams cleanup
-blocks Office installation; Chrome, Drive and independent cleanup selections can
+Office media regardless of the installed Office edition. If Teams removal is checked,
+pending Teams cleanup blocks Office installation; Chrome, Drive and independent cleanup selections can
 continue. Downloading never proves Teams is absent. Restore-point and central
 policy prerequisites remain enforced for the affected operations.
 
@@ -385,8 +388,10 @@ The final Log summary distinguishes `Downloaded`, `Installed`, `AlreadyInstalled
 `Removed`, `Disabled`, `Configured`, `NotPresent` and `Failed`.
 Required cleanup checks are separated from app observations.
 Downloading an installer never reports its app as installed. Failed optional apps
-produce `CompletedWithIssues` only when the required cleanup checks pass; remaining
-Teams, unreadable profiles or policy conflicts cannot be hidden by skipping apps.
+produce `CompletedWithIssues` only when the required selected cleanup checks pass;
+remaining selected Teams components, unreadable relevant profiles or applicable
+policy conflicts cannot be hidden by skipping apps. Unchecked components are not
+certified as absent and do not create failures for unrelated selected tasks.
 
 Keep working directories while tasks are pending. They hold task dependencies and
 may contain preserved Teams data/authentication material; apply your retention
@@ -408,6 +413,39 @@ mocks. They do not install software, change execution policies or create restore
 points. The preview is rendered from the real form without starting deployment.
 
 ## 🚧 Versions
+
+<details>
+<summary><strong>[See/Hide] Version 2.4.0 — Equip gear, remove wasps</strong></summary>
+
+- Two explicit action lists replace App Action and Office options; unchecked actions stay untouched.
+- Fixed Office exclusions for OneDrive, Access and both Outlook versions; Word, Excel, PowerPoint and OneNote remain included.
+- Added Microsoft 365 Copilot's OfficeHub package to the selected Copilot removal and rechecks after Office installation.
+- Waits for services to stop before disabling; final validation still requires stopped and Disabled.
+- Small jade pendant reference, updated previews, scoped validation and configuration tests.
+
+</details>
+
+<details>
+<summary><strong>[See/Hide] Version 2.3.2 — Remote Desktop Connection</strong></summary>
+
+- Added a separate, opt-in removal for the built-in Remote Desktop Connection client (`mstsc`).
+- Uses the Microsoft uninstaller on Windows 11 23H2+, with its restart prompt visible and no automatic-restart switch.
+- Protects active client sessions and saved RDP files; reports pending removal until client binaries are absent.
+- Remote Desktop Services (`TermService`) remains a separate checklist selection.
+
+</details>
+
+<details>
+<summary><strong>[See/Hide] Version 2.3.1 — Startup and OEM utilities</strong></summary>
+
+- GUI startup no longer sets console encoding; startup exceptions display a visible error dialog.
+- Added a GUI-subsystem regression fixture with no console handles and a forced startup failure.
+- Added Power Automate Store/desktop removal; Feedback Hub and Xbox Live remain covered.
+- Added exact Dell/ASUS utility selections with publisher checks, registered MSI or signed quiet uninstallers, and final verification.
+- Unsupported uninstallers and per-user desktop products receive manual instructions; Armoury Crate uses the official ASUS tool workflow.
+- Updated documentation, error codes, previews and the portable executable.
+
+</details>
 
 <details>
 <summary><strong>[See/Hide] Version 2.3.0 — Selectable cleanup and live activity</strong></summary>

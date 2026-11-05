@@ -37,6 +37,8 @@ Codes describe a condition; severity determines whether it is an error, warning 
 | `TNO-501` | Selected app data could not be preserved | Unlock or attach the profile and back up app data before retrying. No removal of this app was started. |
 | `TNO-502` | Service could not be disabled | Review dependencies and policy in services.msc. No dependent services are force-stopped. |
 | `TNO-503` | Desktop or taskbar setting incomplete | Check the Windows edition and policy, sign out and back in, then retry or use Windows Settings. |
+| `TNO-504` | Desktop utility removal incomplete | Use the indicated vendor uninstaller or Windows Installed apps, then retry. Drivers and recovery files are not force-deleted. |
+| `TNO-905` | Application window could not open | Use the latest complete executable and report the startup dialog message. |
 | `TNO-900` | Unexpected engine error | Review Details and report the code and message to the project maintainer. |
 | `TNO-901` | Launcher could not start | Check working-directory access, executable integrity and Windows PowerShell availability. |
 | `TNO-902` | Script execution blocked | Use organization-approved script signing or policy settings; central policy is not overridden. |

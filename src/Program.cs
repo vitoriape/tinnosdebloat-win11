@@ -14,7 +14,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("TinnosDebloat-Win11")]
 [assembly: AssemblyDescription("Windows 11 provisioning and Teams removal")]
-[assembly: AssemblyVersion("2.3.0.0")]
+[assembly: AssemblyVersion("2.4.0.0")]
 
 namespace TinnosDebloat
 {
@@ -80,13 +80,12 @@ namespace TinnosDebloat
         [STAThread]
         private static int Main(string[] args)
         {
+            if (args.Length == 0) return Startup.RunGui(delegate { return Ui.Create(); });
             CultureInfo english = CultureInfo.GetCultureInfo("en-US");
             CultureInfo.DefaultThreadCurrentCulture = english; CultureInfo.DefaultThreadCurrentUICulture = english;
             Thread.CurrentThread.CurrentCulture = english; Thread.CurrentThread.CurrentUICulture = english;
-            Console.OutputEncoding = new UTF8Encoding(false);
-            if (args.Length > 0) return CommandLine(args);
-            Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(Ui.Create()); return 0;
+            try { Console.OutputEncoding = new UTF8Encoding(false); } catch (IOException) { }
+            return CommandLine(args);
         }
         private static int CommandLine(string[] args)
         {
@@ -146,9 +145,55 @@ namespace TinnosDebloat
         }
     }
 
+    public static class Startup
+    {
+        public static int RunGui(Func<Form> createForm) { return RunGui(createForm, ShowFailure); }
+        public static int RunGui(Func<Form> createForm, Action<Exception> failure)
+        {
+            try {
+                // Explorer-launched WinForms applications have no console handle.
+                // Console.OutputEncoding must never be set on this startup path.
+                CultureInfo english = CultureInfo.GetCultureInfo("en-US");
+                CultureInfo.DefaultThreadCurrentCulture = english; CultureInfo.DefaultThreadCurrentUICulture = english;
+                Thread.CurrentThread.CurrentCulture = english; Thread.CurrentThread.CurrentUICulture = english;
+                Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
+                using (Form form = createForm()) { Application.Run(form); }
+                return 0;
+            } catch (Exception error) { failure(error); return 1; }
+        }
+        private static void ShowFailure(Exception error)
+        {
+            // Hard-coded fallback also works if embedded resources could not load.
+            MessageBox.Show("[TNO-905] The application could not display its window." + Environment.NewLine
+                + error.Message + Environment.NewLine + Environment.NewLine
+                + "Use the latest complete executable. Include this message when reporting the problem.",
+                "TinnosDebloat-Win11 - Startup error", MessageBoxButtons.OK, MessageBoxIcon.Error,
+                MessageBoxDefaultButton.Button1, MessageBoxOptions.DefaultDesktopOnly);
+        }
+    }
+
     public static class Ui
     {
         public static Form Create() { return new MainForm(); }
+    }
+
+    internal sealed class JadePendant : Control
+    {
+        public JadePendant() { Name = "jadePendant"; AccessibleName = "Jade pendant reference"; Size = new Size(34, 38);
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true); }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e); e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (Pen gold = new Pen(Color.FromArgb(218, 180, 103), 1.5f))
+            using (Pen engraving = new Pen(Color.FromArgb(156, 225, 176), 1.2f))
+            using (SolidBrush jade = new SolidBrush(Color.FromArgb(35, 117, 83))) {
+                e.Graphics.DrawEllipse(gold, 13, 2, 8, 9);
+                Point[] stone = { new Point(17, 9), new Point(29, 20), new Point(23, 33), new Point(11, 33), new Point(5, 20) };
+                e.Graphics.FillPolygon(jade, stone); e.Graphics.DrawPolygon(gold, stone);
+                e.Graphics.DrawLines(engraving, new Point[] { new Point(11, 19), new Point(21, 19), new Point(21, 25), new Point(14, 25), new Point(14, 29) });
+            }
+        }
     }
 
     internal sealed class MainForm : Form
@@ -156,11 +201,8 @@ namespace TinnosDebloat
         private static readonly Color Background = Color.FromArgb(23, 29, 35);
         private static readonly Color Surface = Color.FromArgb(38, 46, 54);
         private static readonly Color Accent = Color.FromArgb(218, 180, 103);
-        private readonly RadioButton downloadOnly = ModeButton("Download only", true);
-        private readonly RadioButton installApps = ModeButton("Download + install", false);
-        private readonly CheckBox access = Toggle("Include Access", false);
-        private readonly CheckBox oneDrive = Toggle("Exclude OneDrive", true);
-        private readonly CheckBox outlook = Toggle("Exclude new Outlook", true);
+        private readonly CheckedListBox equipment = new CheckedListBox { Name = "installList", Dock = DockStyle.Fill,
+            CheckOnClick = true, HorizontalScrollbar = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
         private readonly Button start = ActionButton("Start");
         private readonly Button details = ActionButton("Details");
         private readonly TextBox log = new TextBox { Name = "liveLog", Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Both,
@@ -168,12 +210,11 @@ namespace TinnosDebloat
         private readonly TextBox errors = new TextBox { Name = "errorDetails", Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical,
             WordWrap = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
         private readonly CheckedListBox cleanup = new CheckedListBox { Name = "removalList", Dock = DockStyle.Fill, Height = 190,
-            CheckOnClick = true, Visible = false, HorizontalScrollbar = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
-        private readonly CheckBox showCleanup = new CheckBox { Name = "cleanupToggle", Text = "Choose apps, services and desktop settings", AutoSize = true, ForeColor = Color.Gainsboro };
+            CheckOnClick = true, HorizontalScrollbar = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
         private readonly List<CleanupItem> cleanupItems = new List<CleanupItem>();
         private readonly HashSet<string> displayedIssues = new HashSet<string>();
         private readonly TabControl detailTabs = new TabControl { Name = "detailTabs", Dock = DockStyle.Fill, Visible = false };
-        private readonly Label status = new Label { Name = "currentTask", Text = "Ready - Office PT-BR", Dock = DockStyle.Fill, Height = 42, ForeColor = Color.Gainsboro, Margin = new Padding(0, 10, 0, 8) };
+        private readonly Label status = new Label { Name = "currentTask", Text = "Ready - select actions, then Start.", Dock = DockStyle.Fill, Height = 42, ForeColor = Color.Gainsboro, Margin = new Padding(0, 10, 0, 8) };
         private readonly ProgressBar progress = new ProgressBar { Dock = DockStyle.Fill, Height = 4 };
         private Process running;
         private string directory, output;
@@ -187,16 +228,27 @@ namespace TinnosDebloat
         public MainForm()
         {
             Text = "TinnosDebloat-Win11"; BackColor = Background; ForeColor = Color.White;
-            Font = new Font("Segoe UI", 10); ClientSize = new Size(760, 420); MinimumSize = new Size(776, 459);
+            Font = new Font("Segoe UI", 10); ClientSize = new Size(940, 550); MinimumSize = new Size(816, 540);
             StartPosition = FormStartPosition.CenterScreen;
-            TableLayoutPanel layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(22), ColumnCount = 1, RowCount = 7 };
-            for (int i = 0; i < 5; i++) layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            TableLayoutPanel layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(22), ColumnCount = 1, RowCount = 6 };
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 310));
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 5));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            layout.Controls.Add(Section("APP ACTION", Row(downloadOnly, installApps), "Restore point and Teams cleanup are always included."));
-            layout.Controls.Add(Section("OFFICE OPTIONS", Row(access, oneDrive, outlook), "Microsoft 365 Apps for Business · PT-BR · 64-bit"));
-            TableLayoutPanel removalPanel = new TableLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, ColumnCount = 1, Margin = new Padding(0, 0, 0, 12) };
-            removalPanel.Controls.Add(showCleanup); removalPanel.Controls.Add(cleanup); layout.Controls.Add(removalPanel);
+            TableLayoutPanel header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 36));
+            header.Controls.Add(new Label { Text = "Marked = execute the action. Unmarked = leave unchanged.", AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Color.Gainsboro });
+            header.Controls.Add(new JadePendant { Anchor = AnchorStyles.Top | AnchorStyles.Right }); layout.Controls.Add(header);
+            equipment.Items.Add(new CleanupItem { Id = "GoogleDrive", Label = "Install Google Drive" }, true);
+            equipment.Items.Add(new CleanupItem { Id = "Office", Label = "Install Microsoft 365 Office" }, true);
+            equipment.Items.Add(new CleanupItem { Id = "Chrome", Label = "Install Google Chrome" }, true);
+            TableLayoutPanel choices = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
+            choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36)); choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 64));
+            choices.Controls.Add(ActionSection("EQUIP GEAR", equipment, "Office: PT-BR, 64-bit. Word, Excel, PowerPoint, OneNote. Teams, OneDrive, Access and Outlook excluded."));
+            choices.Controls.Add(ActionSection("REMOVE WASPS", cleanup, "Uninstall = remove app. Deactivate = stop and disable service. Windows may require sign-out or restart."));
+            layout.Controls.Add(choices);
             using (Stream data = Assembly.GetExecutingAssembly().GetManifestResourceStream("Payload.debloat-catalog.json"))
             using (StreamReader reader = new StreamReader(data)) {
                 foreach (object entry in (object[])ResultChannel.Serializer().DeserializeObject(reader.ReadToEnd())) {
@@ -205,11 +257,6 @@ namespace TinnosDebloat
                     cleanupItems.Add(choice); cleanup.Items.Add(choice, !(Value(item, "DefaultSelected") is bool) || (bool)Value(item, "DefaultSelected"));
                 }
             }
-            cleanup.ItemCheck += delegate(object sender, ItemCheckEventArgs e) {
-                if (cleanupItems[e.Index].Id == "Teams") e.NewValue = CheckState.Checked;
-                if (cleanupItems[e.Index].Id == "NewOutlook" && e.NewValue == CheckState.Checked) outlook.Checked = true;
-            };
-            showCleanup.CheckedChanged += delegate { cleanup.Visible = showCleanup.Checked; SetDetails(detailTabs.Visible); };
             start.Width = 300; details.Width = 140; details.Name = "detailsButton"; start.Name = "startButton";
             layout.Controls.Add(ActionRow(details, start));
             layout.Controls.Add(status); layout.Controls.Add(progress);
@@ -225,26 +272,11 @@ namespace TinnosDebloat
                 if (running != null) { e.Cancel = true; status.Text = "An operation is running. Wait for the result."; }
             };
         }
-        private static CheckBox Toggle(string text, bool selected)
-        {
-            return new CheckBox { Text = text, Checked = selected, AutoSize = true, ForeColor = Color.Gainsboro,
-                Padding = Padding.Empty, Margin = new Padding(0, 0, 16, 0) };
-        }
-        private static RadioButton ModeButton(string text, bool selected)
-        {
-            RadioButton button = new RadioButton { Text = text, Checked = selected, Appearance = Appearance.Button,
-                Width = 298, Height = 38, TextAlign = ContentAlignment.MiddleCenter, FlatStyle = FlatStyle.Flat,
-                Margin = new Padding(0, 0, 8, 0), TabStop = selected };
-            button.FlatAppearance.BorderColor = Accent;
-            Action recolor = delegate { button.BackColor = button.Checked ? Accent : Background; button.ForeColor = button.Checked ? Background : Color.Gainsboro; };
-            button.CheckedChanged += delegate { recolor(); }; recolor(); return button;
-        }
         private void SetDetails(bool show)
         {
             detailTabs.Visible = show;
             int availableHeight = Screen.FromControl(this).WorkingArea.Height - SystemInformation.CaptionHeight - 32;
-            int compact = showCleanup.Checked ? 610 : 420;
-            ClientSize = new Size(ClientSize.Width, Math.Min(availableHeight, show ? Math.Max(compact + 180, 780) : compact));
+            ClientSize = new Size(ClientSize.Width, Math.Min(availableHeight, show ? 820 : 550));
         }
         private static Button ActionButton(string text)
         {
@@ -257,14 +289,15 @@ namespace TinnosDebloat
             FlowLayoutPanel panel = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = Padding.Empty };
             panel.Controls.AddRange(controls); return panel;
         }
-        private static Control Section(string title, Control content, string note)
+        private static Control ActionSection(string title, Control content, string note)
         {
-            TableLayoutPanel card = new TableLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, BackColor = Surface,
+            TableLayoutPanel card = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface,
                 Padding = new Padding(12), Margin = new Padding(0, 0, 0, 12), ColumnCount = 1 };
+            card.RowStyles.Add(new RowStyle(SizeType.AutoSize)); card.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); card.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
             card.Controls.Add(new Label { Text = title, AutoSize = true, ForeColor = Color.FromArgb(167, 181, 194),
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), Margin = new Padding(0, 0, 0, 8) });
             card.Controls.Add(content);
-            if (note != null) card.Controls.Add(new Label { Text = note, AutoSize = true, ForeColor = Color.FromArgb(167, 181, 194),
+            if (note != null) card.Controls.Add(new Label { Text = note, Dock = DockStyle.Fill, ForeColor = Color.FromArgb(167, 181, 194),
                 Font = new Font("Segoe UI", 8.5f), Margin = new Padding(0, 8, 0, 0) });
             return card;
         }
@@ -293,25 +326,32 @@ namespace TinnosDebloat
         }
         private void Busy(bool busy)
         {
-            foreach (Control item in new Control[] { downloadOnly, installApps, access, oneDrive, outlook, cleanup, start }) item.Enabled = !busy;
+            foreach (Control item in new Control[] { equipment, cleanup, start }) item.Enabled = !busy;
             progress.Style = busy ? ProgressBarStyle.Marquee : ProgressBarStyle.Blocks;
+        }
+        public string SelectedConfiguration()
+        {
+            List<string> install = new List<string>(), remove = new List<string>();
+            foreach (CleanupItem item in equipment.CheckedItems) install.Add(item.Id);
+            foreach (CleanupItem item in cleanup.CheckedItems) remove.Add(item.Id);
+            return ResultChannel.Serializer().Serialize(new Dictionary<string, object> {
+                { "LicenseEdition", "Business" }, { "Architecture", "64" }, { "Languages", new string[] { "pt-br" } }, { "Channel", "Current" },
+                { "InstallItems", install.ToArray() }, { "RemoveItems", remove.ToArray() }
+            });
         }
         private void Run()
         {
             if (running != null) return;
             try
             {
+                if (equipment.CheckedItems.Count == 0 && cleanup.CheckedItems.Count == 0) {
+                    status.Text = "Nothing selected. Mark the actions you want to execute.";
+                    Append(status.Text); return;
+                }
+                string config = SelectedConfiguration();
                 directory = Payload.Extract(); output = Path.Combine(directory, "Work");
-                Dictionary<string, object> config = new Dictionary<string, object> {
-                    { "LicenseEdition", "Business" }, { "Architecture", "64" }, { "Languages", new string[] { "pt-br" } }, { "Channel", "Current" },
-                    { "IncludeAccess", access.Checked }, { "ExcludeOneDrive", oneDrive.Checked }, { "ExcludeNewOutlook", outlook.Checked },
-                    { "AppMode", downloadOnly.Checked ? "Download" : "Install" }
-                };
-                List<string> selected = new List<string>();
-                foreach (CleanupItem item in cleanup.CheckedItems) selected.Add(item.Id);
-                config["RemoveItems"] = selected.ToArray();
                 string configPath = Path.Combine(directory, "config.json");
-                File.WriteAllText(configPath, new JavaScriptSerializer().Serialize(config), new UTF8Encoding(false));
+                File.WriteAllText(configPath, config, new UTF8Encoding(false));
                 receivedResult = false; primaryCode = ""; log.Clear(); errors.Clear(); displayedIssues.Clear(); detailTabs.TabPages[1].Text = "Errors";
                 Append("Starting. Results remain in memory. Working files: " + output);
                 running = new Process { StartInfo = Payload.Command(directory, configPath, "Deploy", output), EnableRaisingEvents = true };
