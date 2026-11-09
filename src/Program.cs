@@ -14,7 +14,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("TinnosDebloat-Win11")]
 [assembly: AssemblyDescription("Windows 11 provisioning and Teams removal")]
-[assembly: AssemblyVersion("2.4.0.0")]
+[assembly: AssemblyVersion("2.5.0.0")]
 
 namespace TinnosDebloat
 {
@@ -246,7 +246,7 @@ namespace TinnosDebloat
             equipment.Items.Add(new CleanupItem { Id = "Chrome", Label = "Install Google Chrome" }, true);
             TableLayoutPanel choices = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
             choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36)); choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 64));
-            choices.Controls.Add(ActionSection("EQUIP GEAR", equipment, "Office: PT-BR, 64-bit. Word, Excel, PowerPoint, OneNote. Teams, OneDrive, Access and Outlook excluded."));
+            choices.Controls.Add(ActionSection("EQUIP GEAR", equipment, "Office: PT-BR, 64-bit. Word, Excel, PowerPoint. Teams, OneNote, OneDrive, Access and Outlook excluded."));
             choices.Controls.Add(ActionSection("REMOVE WASPS", cleanup, "Uninstall = remove app. Deactivate = stop and disable service. Windows may require sign-out or restart."));
             layout.Controls.Add(choices);
             using (Stream data = Assembly.GetExecutingAssembly().GetManifestResourceStream("Payload.debloat-catalog.json"))

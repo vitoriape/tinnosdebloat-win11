@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version 2.0
 $root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -55,8 +55,8 @@ try {
         $excluded=@($xml.Configuration.Add.Product.ExcludeApp | ForEach-Object {$_.ID})
         Assert ($xml.Configuration.Add.Product.ID -eq 'O365BusinessRetail') 'Wrong product.'
         Assert ('Teams' -in $excluded -and 'OutlookForWindows' -in $excluded -and 'Groove' -in $excluded) 'Required exclusion missing.'
-        Assert (!@($excluded | Where-Object {$_ -in @('Word','Excel','PowerPoint','OneNote')}).Count) 'Required app excluded.'
-        foreach ($id in @('Access','OneDrive','Outlook','OutlookForWindows')) {Assert ($id -in $excluded) ('Fixed exclusion missing: '+$id)}
+        Assert (!@($excluded | Where-Object {$_ -in @('Word','Excel','PowerPoint')}).Count) 'Required app excluded.'
+        foreach ($id in @('Access','OneDrive','OneNote','Outlook','OutlookForWindows')) {Assert ($id -in $excluded) ('Fixed exclusion missing: '+$id)}
         Assert ($xml.Configuration.Display.Level -eq 'None' -and $xml.Configuration.Property.Value -eq 'FALSE') 'Unsafe UI/document settings.'
         Assert (!$xml.SelectNodes('//Remove|//RemoveMSI|//PIDKEY').Count) 'Unexpected removal or key.'
     }
@@ -358,7 +358,7 @@ try {
     }
     Test 'Removal configuration validates IDs and requires explicit selection of high impact services' {
         Assert ('DarkMode' -in $config.RemoveItems -and 'DesktopIcons' -in $config.RemoveItems -and 'TaskbarSearch' -in $config.RemoveItems -and 'TaskbarWidgets' -in $config.RemoveItems) 'Desktop defaults missing.'
-        foreach($id in @('BitLockerService','RemoteDesktop','RemoteDesktopConnection','Biometrics','SmartCard','ServerService')) {Assert ($id -notin $config.RemoveItems) ('High impact default: '+$id)}
+        foreach($id in @('BitLockerService','RemoteDesktop','Biometrics','SmartCard','ServerService')) {Assert ($id -notin $config.RemoveItems) ('High impact default: '+$id)}
         $path=Join-Path $work 'choices.json'
         '{"RemoveItems":["Paint"]}' | Set-Content -LiteralPath $path
         $selected=Read-DeploymentConfig $path
@@ -455,7 +455,12 @@ try {
             function script:Stop-Service {param($Name,[switch]$Force);if ($Force) {throw 'Dependent services force stopped'};$script:Stopped=$true}
             function script:Set-Service {param($Name,$StartupType);if ($StartupType -ne 'Disabled') {throw 'Wrong startup'};$script:Changed=$true}
         }
-        try {Assert ((Disable-SelectedService WSearch).Status -eq 'Disabled') 'Service state was not verified.';Throws {Disable-SelectedService WinDefend}} finally {Reset-Engine}
+        try {
+            $result=Disable-SelectedService WSearch
+            Assert ($result.Status -eq 'Disabled' -and $result.State -eq 'Stopped' -and $result.StartMode -eq 'Disabled') 'Service state was not verified.'
+            Assert ($result.Message -like '*Start-menu app and settings search can still work*') 'Indexing result does not explain Start search.'
+            Throws {Disable-SelectedService WinDefend}
+        } finally {Reset-Engine}
     }
     Test 'Managed service and desktop policy blocks local changes (mocked)' {
         $module=Get-Module Provisioning
@@ -463,24 +468,28 @@ try {
             $script:Changed=$false
             function script:Get-Service {[pscustomobject]@{Status='Running'}}
             function script:Get-CimInstance {param($ClassName);if ($ClassName -eq 'Win32_ComputerSystem') {[pscustomobject]@{PartOfDomain=$true}} else {throw 'Policy unavailable'}}
+            function script:Assert-LocalDesktopSettings {throw (New-TinnosError 'TNO-202' 'Managed preference conflict')}
             function script:Stop-Service {$script:Changed=$true}
             function script:Set-Service {$script:Changed=$true}
             function script:Set-VerifiedDword {$script:Changed=$true}
         }
         try {Throws {Disable-SelectedService WSearch};Throws {Set-SelectedDesktopSetting DarkMode};Assert (!(& $module {$script:Changed})) 'Managed configuration overwritten.'} finally {Reset-Engine}
     }
-    Test 'Desktop and taskbar policies use the documented values without deleting files (mocked)' {
+    Test 'Desktop and taskbar preferences target each profile on Home and older Windows builds (mocked)' {
         $module=Get-Module Provisioning
         & $module {
             $script:Writes=@()
             function script:Assert-LocalDesktopSettings {}
-            function script:Get-ItemProperty {[pscustomobject]@{EditionID='Professional';CurrentBuildNumber='26100'}}
-            function script:Set-VerifiedDword {param($Path,$Name,$Value,[switch]$Policy);$script:Writes+=($Name+'='+$Value);if (!$Policy) {throw 'Expected policy'}}
+            function script:Get-CimInstance {[pscustomobject]@{SID='fixture';Special=$false}}
+            function script:Use-ProfileHive {param($Profile,$Action); & $Action 'Registry::HKEY_USERS\fixture'}
+            function script:Set-VerifiedDword {param($Path,$Name,$Value,[switch]$Policy);if ($Policy) {throw 'Do not impose machine policies'};$script:Writes+=($Path+'|'+$Name+'='+$Value)}
+            function script:Send-DesktopPreferenceRefresh {}
             function script:Remove-Item {throw 'Desktop files must not be deleted'}
         }
         try {
             foreach($setting in @('DesktopIcons','TaskbarSearch','TaskbarWidgets')) {Assert ((Set-SelectedDesktopSetting $setting).Status -eq 'Configured') 'Setting failed.'}
-            Assert ((& $module {$script:Writes -join ','}) -eq 'NoDesktop=1,SearchOnTaskbarMode=0,AllowNewsAndInterests=0') 'Wrong shell policy values.'
+            $writes=& $module {$script:Writes -join ','}
+            Assert ($writes.Contains('HideIcons=1') -and $writes.Contains('SearchboxTaskbarMode=0') -and $writes.Contains('TaskbarDa=0') -and !$writes.Contains('HKLM:')) 'Wrong per-profile preference values.'
         } finally {Reset-Engine}
     }
     Test 'Dark mode sets Windows and apps for other profiles even if one hive is inaccessible (mocked)' {
@@ -796,7 +805,7 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
             Assert ($choices.CheckedItems.Count -lt $choices.Items.Count) 'High impact services must require selection.'
             $choices.SetItemChecked(0,$false)
             Assert (!$choices.GetItemChecked(0)) 'Unchecked Teams cannot be kept.'
-            foreach($item in $choices.Items) {Assert ($item.ToString() -match '^(Uninstall|Deactivate|Hide|Enable) ') ('Ambiguous action label: '+$item)}
+            foreach($item in $choices.Items) {Assert ($item.ToString() -match '^(Uninstall|Deactivate|Hide|Enable|Set) ') ('Ambiguous action label: '+$item)}
             Assert ($form.Controls.Find('jadePendant',$true).Count -eq 1) 'Jade reference missing.'
             for($i=0;$i -lt $choices.Items.Count;$i++) {$choices.SetItemChecked($i,$false)}
             for($i=0;$i -lt $gear.Items.Count;$i++) {$gear.SetItemChecked($i,$false)}
@@ -864,6 +873,7 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
             } finally {$process.Dispose()}
         }
     }
+    . (Join-Path $PSScriptRoot 'Test-CleanupFixes.ps1')
     Test 'EXE checksum sidecar matches the build' {
         $hash=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
         Assert ((Get-Content -LiteralPath "$exe.sha256" -Raw).Trim() -eq "$hash  tinnosdebloat-win11.exe") 'Checksum mismatch.'

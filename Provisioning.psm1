@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 # Also applies to direct module use and the per-user cleanup/activation helpers.
@@ -10,7 +10,7 @@ $script:ModuleRoot = $PSScriptRoot
 $script:OfficePolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Office\16.0\common\officeupdate'
 $script:BrowserPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
 $script:TeamNames = @('MSTeams', 'MicrosoftTeams')
-$script:RequiredApps = [ordered]@{ Word='WINWORD.EXE'; Excel='EXCEL.EXE'; PowerPoint='POWERPNT.EXE'; OneNote='ONENOTE.EXE' }
+$script:RequiredApps = [ordered]@{ Word='WINWORD.EXE'; Excel='EXCEL.EXE'; PowerPoint='POWERPNT.EXE' }
 $script:Report = $null
 $script:DebloatCatalog = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'debloat-catalog.json')) | ConvertFrom-Json
 $script:ErrorCatalog = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'error-codes.json')) | ConvertFrom-Json
@@ -131,8 +131,8 @@ function Read-DeploymentConfig([string]$Path) {
 
 function Get-DesiredExclusions($Config, $Office) {
     # Keep exclusions for unrelated apps during an existing-install reconfiguration.
-    $excluded = @('Teams','Lync','Publisher','Access','Groove','OneDrive','Outlook','OutlookForWindows') + @(Get-Value $Office 'ExcludedApps' @())
-    $required = @('Word','Excel','PowerPoint','OneNote')
+    $excluded = @('Teams','Lync','Publisher','Access','Groove','OneDrive','Outlook','OutlookForWindows','OneNote') + @(Get-Value $Office 'ExcludedApps' @())
+    $required = @('Word','Excel','PowerPoint')
     @($excluded | Where-Object { $_ -and $_ -notin $required } | Sort-Object -Unique)
 }
 
@@ -378,7 +378,9 @@ function Invoke-Installer([string]$FilePath, [string]$Arguments, [int[]]$Success
     $task = [IO.Path]::GetFileName($FilePath)
     Send-DeploymentEvent 'Task' $task 'Installer running; remaining time is not provided by this installer.'
     $windowStyle = if ($Interactive) {'Normal'} else {'Hidden'}
-    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WindowStyle $windowStyle -PassThru
+    $startArguments=@{FilePath=$FilePath;WindowStyle=$windowStyle;PassThru=$true}
+    if ($Arguments) {$startArguments.ArgumentList=$Arguments}
+    $process = Start-Process @startArguments
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $lastUpdate = 0
     try {
@@ -398,10 +400,11 @@ function Invoke-Installer([string]$FilePath, [string]$Arguments, [int[]]$Success
     return $exitCode
 }
 
-function Assert-Publisher([string]$Path, [ValidateSet('Microsoft','Google','Dell','ASUS')][string]$Publisher) {
+function Assert-Publisher([string]$Path, [ValidateSet('Microsoft','Google','Dell','ASUS','McAfee')][string]$Publisher) {
     $signature = Get-AuthenticodeSignature -LiteralPath $Path
     $organization = switch ($Publisher) {
         'Dell' {'O="?Dell(?:,? Inc\.?| Technologies,? Inc\.?| Products,? L\.?P\.?)"?(?:,|$)'}
+        'McAfee' {'O="?McAfee(?:,? (?:LLC|Inc\.?|Corp\.?|Corporation))?"?(?:,|$)'}
         'ASUS' {'O="?ASUSTeK COMPUTER INC\.?"?(?:,|$)'}
         default {"O=$Publisher (Corporation|LLC|Inc\.)[, ]"}
     }
@@ -558,18 +561,20 @@ function Get-UserCleanupResults($Inventory, [switch]$RemoveCompleted) {
     }
 }
 
-function Register-UserCleanup($Profile, [string]$Directory) {
+function Register-UserCleanup($Profile, [string]$Directory, [ValidateSet('','OneDrive')][string]$NativeItem = '') {
     $code = Join-Path $Directory 'UserCleanup'
     Initialize-ProtectedDirectory $code
     foreach ($file in @('Invoke-UserCleanup.ps1','Provisioning.psm1','error-codes.json','debloat-catalog.json')) { Copy-Item -LiteralPath (Join-Path $script:ModuleRoot $file) -Destination $code -Force }
-    $name = 'TinnosDebloat-Win11-RemoveTeams-' + $Profile.SID
-    $action = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$code\Invoke-UserCleanup.ps1`""
+    $name = if ($NativeItem) {"TinnosDebloat-Win11-Remove$NativeItem-$($Profile.SID)"} else {'TinnosDebloat-Win11-RemoveTeams-' + $Profile.SID}
+    $arguments="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$code\Invoke-UserCleanup.ps1`""
+    if ($NativeItem) {$arguments+=" -NativeItem $NativeItem"}
+    $action = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $arguments
     $principal = New-ScheduledTaskPrincipal -UserId $Profile.SID -LogonType Interactive -RunLevel Limited
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $Profile.SID
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -MultipleInstances IgnoreNew
     $null = Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Trigger $trigger -Settings $settings -Force
     if ($Profile.Loaded) { try { Start-ScheduledTask -TaskName $name } catch { $script:Report.Pending += "Sign into profile $($Profile.SID) to complete cleanup: $_" } }
-    $script:Report.Pending += "User cleanup scheduled: $name. Sign in, close Outlook/Teams, then press Start again."
+    $script:Report.Pending += "User cleanup scheduled: $name. Sign into the owning profile, close the affected apps, then press Start again."
 }
 
 function Remove-TeamsApplications($Inventory, $Config, [string]$Directory) {
@@ -930,7 +935,9 @@ function Get-DeploymentChecks($Config, $Office, $Teams, $Policies, $Google, [str
             continue
         }
         if ($app.Action -eq 'Configure' -and $app.Name -ne 'ChromeDefaults') {
-            $checks += [pscustomobject]@{Name=$app.Name;Pass=($app.Status -eq 'Configured');Required=$true;Category='Debloat';Detail=$app;ErrorCode='TNO-503'}
+            $setting=Get-Value $app.Detail 'Setting' ''; $verified=$false
+            try {if ($setting) {$verified=Test-DesktopSettingState $setting}} catch {$verified=$false}
+            $checks += [pscustomobject]@{Name=$app.Name;Pass=($app.Status -eq 'Configured' -and $verified);Required=$true;Category='Debloat';Detail=$app;ErrorCode='TNO-503'}
             continue
         }
         if ($app.Name -eq 'ChromeDefaults') { continue }
@@ -1062,7 +1069,9 @@ function Disable-SelectedService([string]$Name) {
     Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
     $current = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
     if ($current.StartMode -ne 'Disabled' -or $current.State -ne 'Stopped') { throw (New-TinnosError 'TNO-502' "$Name is not both stopped and disabled. Retry or use services.msc after resolving dependencies/policy.") }
-    return [pscustomobject]@{Status='Disabled';PreviousStartMode=$previous.StartMode;PreviousState=$previous.State}
+    $detail=if ($Name -eq 'WSearch') {'File indexing is disabled. Start-menu app and settings search can still work without the file index. Existing index files are preserved; Outlook searches may be slower.'} else {'Service shutdown and disabled startup verified.'}
+    Send-DeploymentEvent 'Success' $Name "State: $($current.State); startup: $($current.StartMode). $detail"
+    return [pscustomobject]@{Status='Disabled';PreviousStartMode=$previous.StartMode;PreviousState=$previous.State;State=$current.State;StartMode=$current.StartMode;Message=$detail}
 }
 
 function Get-RemoteDesktopConnectionState {
@@ -1091,33 +1100,51 @@ function Remove-RemoteDesktopConnection {
     return [pscustomobject]@{Status='Removed'}
 }
 
-function Get-DesktopUtilityInventory([string]$Id) {
+function Get-DesktopUtilityInventory([string]$Id, [switch]$CurrentUserOnly) {
     $definition=@($script:DebloatCatalog | Where-Object {$_.Id -eq $Id -and (Get-Value $_ 'DesktopProducts')})
     if ($definition.Count -ne 1) {throw (New-TinnosError 'TNO-100' 'Desktop removal is limited to catalog products.')}
     $names=@($definition[0].DesktopProducts)
-    $entries=@(Get-UninstallEntries | Where-Object {$_.Name -in $names})
+    $hive=if ($CurrentUserOnly) {'HKCU:'} else {'HKLM:'}
+    $entries=@(Get-UninstallEntries $hive | Where-Object {$_.Name -in $names})
     # Inspect per-user entries, but do not run another user's uninstaller elevated.
-    foreach ($profile in @(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object {!$_.Special})) {
-        $entries+=@(Use-ProfileHive $profile {param($Hive);Get-UninstallEntries $Hive | Where-Object {$_.Name -in $names}})
+    $errors=@()
+    if (!$CurrentUserOnly) {foreach ($profile in @(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object {!$_.Special})) {
+        try {
+            $userEntries=@(Use-ProfileHive $profile {param($Hive);Get-UninstallEntries $Hive | Where-Object {$_.Name -in $names}})
+            foreach ($entry in $userEntries) {$entry | Add-Member NoteProperty OwnerProfile $profile -Force}
+            $entries+=$userEntries
+        } catch {$errors+="Profile $($profile.SID): $($_.Exception.Message)"}
+    }
     }
     $packages=@();$provisioned=@()
     foreach ($name in @(Get-Value $definition[0] 'DetectionPackages' @())) {
         $packages+=@(Get-AppxPackage -AllUsers -Name $name -ErrorAction Stop | Where-Object {$_.Name -eq $name})
         $provisioned+=@(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {$_.DisplayName -eq $name})
     }
-    [pscustomobject]@{Entries=$entries;Packages=$packages;Provisioned=$provisioned;Definition=$definition[0]}
+    [pscustomobject]@{Entries=$entries;Packages=$packages;Provisioned=$provisioned;Definition=$definition[0];Errors=$errors}
 }
 
-function Get-DesktopQuietCommand($Entry, [string]$Vendor) {
+function Get-DesktopQuietCommand($Entry, [string]$Vendor, [switch]$UserContext) {
     $quiet=[string](Get-Value $Entry 'QuietUninstallString' '')
-    $match=[regex]::Match($quiet, '^"([^"\r\n]+\.exe)"\s+([^\r\n]+)$|^(\S+\.exe)\s+([^\r\n]+)$', 'IgnoreCase')
+    $interactive=$false
+    if (!$quiet -and ($Vendor -in @('Dell','McAfee') -or $Entry.Name -eq 'Microsoft OneDrive')) {
+        $quiet=[string](Get-Value $Entry 'UninstallString' '')
+        $interactive=$Entry.Name -ne 'Microsoft OneDrive'
+    }
+    $quiet=[Environment]::ExpandEnvironmentVariables($quiet)
+    $match=[regex]::Match($quiet, '^"([^"\r\n]+\.exe)"(?:\s+([^\r\n]+))?$|^(\S+\.exe)(?:\s+([^\r\n]+))?$', 'IgnoreCase')
     if (!$match.Success) {throw (New-TinnosError 'TNO-504' "No supported silent uninstaller is registered for $($Entry.Name). Use Windows Installed apps.")}
     $file=if ($match.Groups[1].Success) {$match.Groups[1].Value} else {$match.Groups[3].Value}
     $arguments=if ($match.Groups[1].Success) {$match.Groups[2].Value} else {$match.Groups[4].Value}
     if (![IO.Path]::IsPathRooted($file)) {throw (New-TinnosError 'TNO-504' 'The vendor uninstaller must use an absolute local path.')}
     $file=[IO.Path]::GetFullPath($file)
     $allowed=$false
-    foreach ($root in @($env:ProgramFiles,${env:ProgramFiles(x86)},$env:ProgramData) | Where-Object {$_}) {
+    $roots=@($env:ProgramFiles,${env:ProgramFiles(x86)},$env:ProgramData)
+    if ($UserContext) {$roots+= $env:LOCALAPPDATA}
+    if ($Entry.Name -eq 'Microsoft OneDrive' -and [IO.Path]::GetFileName($file) -ieq 'OneDriveSetup.exe') {
+        $roots+=@((Join-Path $env:WINDIR 'System32'),(Join-Path $env:WINDIR 'SysWOW64'))
+    }
+    foreach ($root in @($roots | Where-Object {$_})) {
         if ([IO.Path]::IsPathRooted($file) -and $file.StartsWith(([IO.Path]::GetFullPath($root).TrimEnd('\')+'\'),[StringComparison]::OrdinalIgnoreCase)) {$allowed=$true}
     }
     if (!$allowed -or $file.StartsWith('\\')) {throw (New-TinnosError 'TNO-504' 'The registered vendor uninstaller is outside trusted local application directories.')}
@@ -1125,44 +1152,94 @@ function Get-DesktopQuietCommand($Entry, [string]$Vendor) {
         if ((Get-Item -LiteralPath $path -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) {throw (New-TinnosError 'TNO-504' 'A redirected vendor uninstaller was rejected.')}
     }
     Assert-Publisher $file $Vendor
-    [pscustomobject]@{File=$file;Arguments=$arguments}
+    [pscustomobject]@{File=$file;Arguments=$arguments;Interactive=$interactive}
 }
 
-function Remove-DesktopUtility([string]$Id) {
-    $inventory=Get-DesktopUtilityInventory $Id
+function Remove-DesktopUtility([string]$Id, [string]$Directory, [switch]$UserContext) {
+    if ($UserContext) {
+        if ($Id -ne 'OneDrive' -or ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw (New-TinnosError 'TNO-504' 'Per-user OneDrive removal must run with the owning user limited token.')
+        }
+    }
+    $inventory=Get-DesktopUtilityInventory $Id -CurrentUserOnly:$UserContext
     $definition=$inventory.Definition
-    if (!$inventory.Entries.Count -and !$inventory.Packages.Count -and !$inventory.Provisioned.Count) {return [pscustomobject]@{Status='NotPresent';ProductId=$Id}}
+    if (!$inventory.Entries.Count -and !$inventory.Packages.Count -and !$inventory.Provisioned.Count -and !@(Get-Value $inventory 'Errors' @()).Count) {return [pscustomobject]@{Status='NotPresent';ProductId=$Id}}
     if (Get-Value $definition 'ManualUrl') {throw (New-TinnosError 'TNO-504' "Use the official ASUS uninstall tool for complete $Id removal, then reboot and retry. $($definition.ManualUrl)")}
     $publisherPattern=switch ($definition.Vendor) {
         'Dell' {'^Dell(?:,? Inc\.?| Technologies,? Inc\.?| Products,? L\.?P\.?)?$'}
         'ASUS' {'^(?:ASUSTeK COMPUTER INC\.?|ASUS)$'}
         'Microsoft' {'^Microsoft(?: Corporation)?$'}
+        'McAfee' {'^McAfee(?:,? (?:LLC|Inc\.?|Corp\.?|Corporation))?$'}
         default {throw (New-TinnosError 'TNO-100' 'Unknown desktop utility vendor.')}
     }
+    $scheduled=@()
     foreach ($entry in $inventory.Entries) {
         try {
-            if ($entry.Scope -ne 'HKLM:') {throw (New-TinnosError 'TNO-504' "Remove $($entry.Name) while signed into its owning user account. Its per-user uninstaller was not run as administrator.")}
+            if ($entry.Scope -ne 'HKLM:' -and !$UserContext) {
+                if ($Id -eq 'OneDrive' -and $Directory -and (Get-Value $entry 'OwnerProfile')) {
+                    Register-UserCleanup $entry.OwnerProfile $Directory -NativeItem OneDrive
+                    $scheduled+=$entry.OwnerProfile.SID
+                    continue
+                }
+                throw (New-TinnosError 'TNO-504' "Remove $($entry.Name) while signed into its owning user account. Its per-user uninstaller was not run as administrator.")
+            }
             if ((Get-Value $entry 'Publisher' '') -notmatch $publisherPattern) {throw (New-TinnosError 'TNO-504' "Publisher mismatch for $($entry.Name). Use the vendor's uninstaller manually.")}
             Send-DeploymentEvent 'Task' $entry.Name 'Running the registered vendor uninstaller.'
             if ($entry.WindowsInstaller -eq 1 -and $entry.Key -match '^\{[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\}$') {
                 $null=Invoke-Installer "$env:WINDIR\System32\msiexec.exe" "/x $($entry.Key) /qn /norestart" @(0,1605,1614,3010,1641)
             } else {
-                $command=Get-DesktopQuietCommand $entry $definition.Vendor
-                $null=Invoke-Installer $command.File $command.Arguments @(0,1605,1614,3010,1641)
+                $command=Get-DesktopQuietCommand $entry $definition.Vendor -UserContext:$UserContext
+                $null=Invoke-Installer $command.File $command.Arguments @(0,1605,1614,3010,1641) -Interactive:([bool](Get-Value $command 'Interactive' $false))
             }
         } catch {Add-RunIssue (New-DeploymentIssue 'TNO-504' $_.Exception.Message $entry.Name 'Error' $_)}
     }
-    $remaining=Get-DesktopUtilityInventory $Id
+    $remaining=Get-DesktopUtilityInventory $Id -CurrentUserOnly:$UserContext
+    if (@(Get-Value $remaining 'Errors' @()).Count) {throw (New-TinnosError 'TNO-200' "Machine removal was attempted, but $Id absence cannot be verified in every profile: $($remaining.Errors -join '; ')")}
+    if ($scheduled.Count -and $remaining.Entries.Count) {return [pscustomobject]@{Status='Pending';ProductId=$Id;Profiles=$scheduled;Reason='Owning user cleanup scheduled. Sign in and retry to verify absence; synced files are preserved.'}}
     if ($remaining.Entries.Count -or $remaining.Packages.Count -or $remaining.Provisioned.Count) {throw (New-TinnosError 'TNO-504' "$Id still has installed components. Review Errors, reboot if indicated, or uninstall manually.")}
     return [pscustomobject]@{Status='Removed';ProductId=$Id}
 }
 
-function Assert-LocalDesktopSettings {
-    if ((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).PartOfDomain) { throw (New-TinnosError 'TNO-202' 'This device is domain joined. Apply desktop and taskbar preferences through your administrator to preserve central policy.') }
-    $enrollments='HKLM:\SOFTWARE\Microsoft\Enrollments'
-    if (Test-Path -LiteralPath $enrollments) {
-        foreach ($key in @(Get-ChildItem -LiteralPath $enrollments -ErrorAction Stop)) {
-            if ((Get-Value (Get-ItemProperty -LiteralPath $key.PSPath) 'EnrollmentState' 0) -eq 1) { throw (New-TinnosError 'TNO-202' 'MDM enrollment detected. Apply desktop and taskbar preferences centrally.') }
+function Assert-LocalDesktopSettings([string]$Setting, [string]$Hive) {
+    # Inspect effective policy for this preference, not blanket domain membership.
+    # Existing GPO/MDM values are never changed by the preference writer.
+    $rules=@(switch ($Setting) {
+        'DesktopIcons' {,@('Software\Microsoft\Windows\CurrentVersion\Policies\Explorer','NoDesktop',1)}
+        'TaskbarSearch' {,@('Software\Policies\Microsoft\Windows\Windows Search','SearchOnTaskbarMode',0)}
+        'TaskbarWidgets' {,@('Software\Policies\Microsoft\Dsh','AllowNewsAndInterests',0)}
+        'DarkMode' {,@('Software\Policies\Microsoft\Windows\Personalization','PersonalColors_Light',0)}
+        'AccentGold' {,@('Software\Policies\Microsoft\Windows\Personalization','NoChangingColor',0)}
+        'BackgroundMoss' {,@('Software\Microsoft\Windows\CurrentVersion\Policies\System','Wallpaper','');,@('Software\Policies\Microsoft\Windows\Personalization','NoChangingWallPaper',0)}
+    })
+    foreach ($root in @('HKLM:',$Hive) | Where-Object {$_}) {
+        foreach ($rule in $rules) {
+            $path="$root\$($rule[0])"
+            if (Test-Path -LiteralPath $path) {
+                $value=Get-Value (Get-ItemProperty -LiteralPath $path -ErrorAction Stop) $rule[1]
+                if ($null -ne $value -and [string]$value -ne [string]$rule[2]) {throw (New-TinnosError 'TNO-202' "Managed or existing policy conflicts with $Setting at $path / $($rule[1]). Apply it centrally; policy was preserved.")}
+            }
+        }
+        if ($Setting -in @('DarkMode','AccentGold','BackgroundMoss')) {
+            $path="$root\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+            if (Test-Path -LiteralPath $path) {
+                $values=Get-ItemProperty -LiteralPath $path -ErrorAction Stop
+                foreach ($name in @('NoThemesTab','NoDispAppearancePage','NoDispBackgroundPage')) {
+                    if ((Get-Value $values $name 0) -ne 0) {throw (New-TinnosError 'TNO-202' "Personalization is restricted by $name. The restriction was preserved.")}
+                }
+            }
+        }
+    }
+    $mdm=@(switch ($Setting) {
+        'TaskbarSearch' {,@('Search','ConfigureSearchOnTaskbarMode',0)}
+        'TaskbarWidgets' {,@('NewsAndInterests','AllowNewsAndInterests',0)}
+        'BackgroundMoss' {,@('Personalization','DesktopImageUrl','')}
+        'DarkMode' {,@('Personalization','PersonalColors_Light',0)}
+    })
+    foreach ($rule in $mdm) {
+        $path="HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\$($rule[0])"
+        if (Test-Path -LiteralPath $path) {
+            $value=Get-Value (Get-ItemProperty -LiteralPath $path -ErrorAction Stop) $rule[1]
+            if ($null -ne $value -and [string]$value -ne [string]$rule[2]) {throw (New-TinnosError 'TNO-202' "Effective MDM policy conflicts with $Setting. Change the assigned policy centrally.")}
         }
     }
 }
@@ -1175,37 +1252,105 @@ function Set-VerifiedDword([string]$Path, [string]$Name, [int]$Value, [switch]$P
     if ((Get-Value (Get-ItemProperty -LiteralPath $Path) $Name) -ne $Value) { throw (New-TinnosError 'TNO-503' "Could not verify $Name at $Path.") }
 }
 
-function Set-SelectedDesktopSetting([ValidateSet('DesktopIcons','TaskbarSearch','TaskbarWidgets','DarkMode')][string]$Setting) {
-    Assert-LocalDesktopSettings
-    $windows = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-    if ($Setting -ne 'DarkMode' -and $windows.EditionID -notmatch 'Professional|Enterprise|Education|IoT') { throw (New-TinnosError 'TNO-503' 'This Windows edition does not support the required desktop/taskbar policy. Use Windows Settings manually.') }
-    switch ($Setting) {
-        'DesktopIcons' {Set-VerifiedDword 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'NoDesktop' 1 -Policy}
-        'TaskbarSearch' {
-            if ([int]$windows.CurrentBuildNumber -lt 26100) {throw (New-TinnosError 'TNO-503' 'Taskbar search policy requires Windows 11 24H2 or newer in this tool. Hide search manually in Taskbar settings on this version.')}
-            Set-VerifiedDword 'HKLM:\Software\Policies\Microsoft\Windows\Windows Search' 'SearchOnTaskbarMode' 0 -Policy
+function Get-DesktopPreferenceValues([string]$Setting) {
+    $advanced='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+    $personalize='Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+    $values=@(switch ($Setting) {
+        'DesktopIcons' {,@($advanced,'HideIcons',1,'DWord')}
+        'TaskbarSearch' {,@('Software\Microsoft\Windows\CurrentVersion\Search','SearchboxTaskbarMode',0,'DWord')}
+        'TaskbarWidgets' {,@($advanced,'TaskbarDa',0,'DWord')}
+        'DarkMode' {,@($personalize,'AppsUseLightTheme',0,'DWord');,@($personalize,'SystemUsesLightTheme',0,'DWord')}
+        'AccentGold' {
+            $abgr=[BitConverter]::ToInt32([byte[]](255,185,0,255),0)
+            $argb=[BitConverter]::ToInt32([byte[]](0,185,255,255),0)
+            ,@('Software\Microsoft\Windows\DWM','AccentColor',$abgr,'DWord')
+            ,@('Software\Microsoft\Windows\DWM','ColorizationColor',$argb,'DWord')
+            ,@('Software\Microsoft\Windows\DWM','ColorPrevalence',1,'DWord')
+            ,@('Software\Microsoft\Windows\CurrentVersion\Explorer\Accent','AccentColorMenu',$abgr,'DWord')
+            ,@('Software\Microsoft\Windows\CurrentVersion\Explorer\Accent','StartColorMenu',$abgr,'DWord')
+            ,@('Control Panel\Desktop','AutoColorization',0,'DWord')
+            ,@($personalize,'ColorPrevalence',1,'DWord')
         }
-        'TaskbarWidgets' {Set-VerifiedDword 'HKLM:\Software\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0 -Policy}
-        'DarkMode' {
-            $profiles=@(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object {!$_.Special})
-            if (!$profiles.Count) {throw (New-TinnosError 'TNO-503' 'No applicable local profiles found for dark mode.')}
-            $failed=$false
-            foreach ($profile in $profiles) {
-                try {
-                    Use-ProfileHive $profile {
-                        param($Hive)
-                        $path="$Hive\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-                        Set-VerifiedDword $path 'AppsUseLightTheme' 0
-                        Set-VerifiedDword $path 'SystemUsesLightTheme' 0
-                    }
-                    Send-DeploymentEvent 'Success' 'Dark mode' "Configured for $($profile.SID). Sign out and back in to apply."
-                } catch { $failed=$true; Add-RunIssue (New-DeploymentIssue 'TNO-503' $_.Exception.Message "Dark mode - $($profile.SID)" 'Error' $_) }
-            }
-            if ($failed) {throw (New-TinnosError 'TNO-503' 'Dark mode could not be configured for every applicable profile. Retry after unlocking affected profiles.')}
+        'BackgroundMoss' {
+            ,@('Control Panel\Colors','Background','72 104 96','String')
+            ,@('Control Panel\Desktop','Wallpaper','','String')
+            ,@('Control Panel\Desktop','WallpaperStyle','0','String')
+            ,@('Control Panel\Desktop','TileWallpaper','0','String')
+            ,@('Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers','BackgroundType',1,'DWord')
         }
+        default {throw (New-TinnosError 'TNO-100' 'Unknown desktop preference.')}
+    })
+    foreach ($value in $values) {[pscustomobject]@{Path=$value[0];Name=$value[1];Value=$value[2];Type=$value[3]}}
+}
+
+function Set-DesktopPreferenceValue([string]$Hive, $Preference) {
+    $path="$Hive\$($Preference.Path)"
+    if ($Preference.Type -eq 'DWord') {Set-VerifiedDword $path $Preference.Name $Preference.Value; return}
+    $null=New-Item -Path $path -Force
+    $null=New-ItemProperty -LiteralPath $path -Name $Preference.Name -Value $Preference.Value -PropertyType String -Force
+    if ([string](Get-Value (Get-ItemProperty -LiteralPath $path) $Preference.Name) -cne [string]$Preference.Value) {throw (New-TinnosError 'TNO-503' "Could not verify $($Preference.Name).")}
+}
+
+function Send-DesktopPreferenceRefresh([string]$Setting) {
+    if (!('TinnosDesktopNative' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class TinnosDesktopNative {
+ [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool SystemParametersInfo(int a, int b, string c, int d);
+ [DllImport("user32.dll")] public static extern bool SetSysColors(int n, int[] elements, int[] colors);
+ [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr h, uint m, UIntPtr w, string l, uint f, uint t, out UIntPtr r);
+ [DllImport("shell32.dll")] public static extern void SHChangeNotify(uint e, uint f, IntPtr a, IntPtr b);
+}
+"@
     }
-    Send-DeploymentEvent 'Task' $Setting 'Setting verified in the registry. Sign out and back in to apply; Explorer was not force-restarted.'
-    return [pscustomobject]@{Status='Configured';Apply='Next sign-in';Setting=$Setting}
+    if ($Setting -eq 'BackgroundMoss') {
+        if (![TinnosDesktopNative]::SystemParametersInfo(20,0,'',3)) {throw (New-TinnosError 'TNO-503' 'Windows could not refresh the current desktop wallpaper. Sign out and retry.')}
+        $null=[TinnosDesktopNative]::SetSysColors(1,[int[]]@(1),[int[]]@(72 -bor (104 -shl 8) -bor (96 -shl 16)))
+    }
+    $result=[UIntPtr]::Zero
+    $null=[TinnosDesktopNative]::SendMessageTimeout([IntPtr]0xffff,0x001a,[UIntPtr]::Zero,'ImmersiveColorSet',2,1000,[ref]$result)
+    $null=[TinnosDesktopNative]::SendMessageTimeout([IntPtr]0xffff,0x001a,[UIntPtr]::Zero,'TraySettings',2,1000,[ref]$result)
+    [TinnosDesktopNative]::SHChangeNotify(0x08000000,0,[IntPtr]::Zero,[IntPtr]::Zero)
+}
+
+function Test-DesktopSettingState([string]$Setting) {
+    $profiles=@(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object {!$_.Special})
+    if (!$profiles.Count) {return $false}
+    foreach ($profile in $profiles) {
+        $results=@(Use-ProfileHive $profile {
+            param($Hive)
+            Assert-LocalDesktopSettings $Setting $Hive
+            foreach ($preference in @(Get-DesktopPreferenceValues $Setting)) {
+                $path="$Hive\$($preference.Path)"
+                if (!(Test-Path -LiteralPath $path)) {$false;continue}
+                $actual=Get-Value (Get-ItemProperty -LiteralPath $path -ErrorAction Stop) $preference.Name
+                $null -ne $actual -and [string]$actual -ceq [string]$preference.Value
+            }
+        })
+        if (!$results.Count -or $false -in $results) {return $false}
+    }
+    return $true
+}
+
+function Set-SelectedDesktopSetting([ValidateSet('DesktopIcons','TaskbarSearch','TaskbarWidgets','DarkMode','AccentGold','BackgroundMoss')][string]$Setting) {
+    $profiles=@(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object {!$_.Special})
+    if (!$profiles.Count) {throw (New-TinnosError 'TNO-503' 'No applicable local profiles found.')}
+    $failed=$false; $applied=@()
+    foreach ($profile in $profiles) {
+        try {
+            Use-ProfileHive $profile {
+                param($Hive)
+                Assert-LocalDesktopSettings $Setting $Hive
+                foreach ($preference in @(Get-DesktopPreferenceValues $Setting)) {Set-DesktopPreferenceValue $Hive $preference}
+            }
+            $applied+=$profile.SID
+            if ($profile.SID -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {Send-DesktopPreferenceRefresh $Setting}
+            Send-DeploymentEvent 'Success' $Setting "Preferences verified for $($profile.SID). Sign out and back in if the shell still shows its cached state. No files were deleted."
+        } catch {$failed=$true;Add-RunIssue (New-DeploymentIssue 'TNO-503' $_.Exception.Message "$Setting - $($profile.SID)" 'Error' $_)}
+    }
+    if ($failed) {throw (New-TinnosError 'TNO-503' "$Setting could not be configured for every applicable profile. Review policy/profile errors, then retry.")}
+    return [pscustomobject]@{Status='Configured';Apply='Current account refresh requested; other profiles next sign-in';Setting=$Setting;Profiles=$applied}
 }
 
 function Invoke-SelectedDebloat($Config, [string]$Directory) {
@@ -1219,7 +1364,7 @@ function Invoke-SelectedDebloat($Config, [string]$Directory) {
         foreach ($service in $item.Services) {
             Invoke-ApplicationStep $service 'Disable' { Disable-SelectedService $service }
         }
-        if (Get-Value $item 'DesktopProducts') {Invoke-ApplicationStep $item.Id 'RemoveDesktop' {Remove-DesktopUtility $item.Id}}
+        if (Get-Value $item 'DesktopProducts') {Invoke-ApplicationStep $item.Id 'RemoveDesktop' {Remove-DesktopUtility $item.Id $Directory}}
         if ((Get-Value $item 'WindowsApp') -eq 'RemoteDesktopConnection') {Invoke-ApplicationStep $item.Id 'RemoveRdc' {Remove-RemoteDesktopConnection}}
         if (Get-Value $item 'Setting') { Invoke-ApplicationStep $item.Name 'Configure' {Set-SelectedDesktopSetting $item.Setting} }
         $remaining--
@@ -1262,9 +1407,9 @@ function Invoke-DeploymentSteps($Config, $Office, $Teams, $Policies, [string]$Xm
     }
     if ($Config.AppMode -eq 'Install' -and @($script:Report.Applications | Where-Object {$_.Name -eq 'Office' -and $_.Status -in @('Installed','AlreadyInstalled')}).Count) {
         $postOffice=$Config.PSObject.Copy()
-        $postOffice.RemoveItems=@($removeItems | Where-Object {$_ -in @('Copilot','NewOutlook')})
+        $postOffice.RemoveItems=@($removeItems | Where-Object {$_ -in @('Copilot','NewOutlook','Microsoft365Companions','OneDrive')})
         if ($postOffice.RemoveItems.Count) {
-            Send-DeploymentEvent 'Task' 'Post-Office cleanup' 'Rechecking selected Copilot and new Outlook packages after Office installation.'
+            Send-DeploymentEvent 'Task' 'Post-Office cleanup' 'Rechecking selected Copilot, Outlook, companion apps and OneDrive after Office installation.'
             $null=Invoke-MaintenanceStep 'Post-Office selected removals' {Invoke-SelectedDebloat $postOffice $Directory} 'TNO-500'
         }
     }

@@ -4,7 +4,7 @@ Windows 11 cleanup and workstation provisioning, with a restore point before dep
 
 <div align="center">
 
-![version](https://img.shields.io/badge/version-2.4.0-dab467.svg)
+![version](https://img.shields.io/badge/version-2.5.0-dab467.svg)
 ![status](https://img.shields.io/badge/status-preview-64748b.svg)
 ![platform](https://img.shields.io/badge/Windows_11-x64-0078D4.svg)
 ![launcher](https://img.shields.io/badge/C%23-WinForms-512BD4.svg)
@@ -60,8 +60,8 @@ shared frameworks and personal documents are preserved.
 | Component | Behavior |
 | --- | --- |
 | Microsoft 365 Apps for Business | Official ODT, `O365BusinessRetail`, 64-bit, Current Channel |
-| Word, Excel, PowerPoint, OneNote | Included in Office; verified when Office installation is selected |
-| Access, OneDrive, classic and new Outlook | Always excluded from the Office deployment; existing standalone products/documents are not force-deleted |
+| Word, Excel, PowerPoint | Included in Office; verified when Office installation is selected |
+| OneNote, Access, OneDrive, classic and new Outlook | Always excluded from the Office deployment; existing standalone products/documents are not force-deleted |
 | Teams | Always excluded from Office; Teams removal runs only when its Uninstall entry is checked |
 | New Outlook | Its Windows Store package is removed only when the corresponding Uninstall entry is checked |
 | Chrome | Official Google Enterprise MSI; browser associations configured only in Install mode |
@@ -110,7 +110,7 @@ reference to the game's artifacts.
 | **REMOVE WASPS** | Uninstall (app), Deactivate (service), Hide (UI item), Enable dark mode | Execute exactly the action named on that line |
 
 Office is fixed to **Business, PT-BR, 64-bit, Current Channel**, including Word,
-Excel, PowerPoint and OneNote. Teams, OneDrive, Access, classic Outlook and new
+Excel and PowerPoint. Teams, OneNote, OneDrive, Access, classic Outlook and new
 Outlook are always excluded from the Office configuration. No license sign-in or
 activation is attempted. Unchecking Office leaves the existing Office installation
 alone. An already installed standalone OneDrive or Outlook product is not removed
@@ -516,3 +516,29 @@ points. The preview is rendered from the real form without starting deployment.
 ---
 
 Developed by [Vitória Peçanha](https://github.com/vitoriape).
+
+## Version 2.5.0 - Cleanup and appearance fixes
+
+- Desktop icons, search and Widgets use each existing user's preference hive,
+  including Windows Home and pre-24H2 builds. Effective conflicting policies are
+  reported and preserved. Final verification re-reads the preferences.
+- Dark mode, Yellow gold / Ouro Amarelo (`#FFB900`) accent and a solid Moss / Musgo
+  (`#486860`) desktop background are selectable defaults. No wallpaper downloads
+  or desktop file deletions are involved. Current-user refresh is requested;
+  other active accounts may need sign-out/sign-in.
+- Added Microsoft 365 companion apps (`Microsoft.M365Companions`), OneDrive,
+  McAfee WebAdvisor and Dell Connected Service Delivery/Subagent. Expanded exact
+  SupportAssist/Optimizer names; Optimizer and Remote Desktop Connection removal
+  are now checked by default. Drivers and saved documents are preserved.
+- Native vendor uninstallers can display their registered confirmation prompt if
+  no supported quiet command exists. Remaining products are reported, not hidden.
+- Per-user OneDrive uninstallers run through owning-user limited-token tasks,
+  never as the administrator. Sign in and run Tinnos again to verify completion.
+  OneDrive folders, online-only files and cloud contents are not deleted; files
+  that are online-only remain accessible through the user's OneDrive account.
+- Office installs Word, Excel and PowerPoint; OneNote is now explicitly excluded
+  alongside Teams, OneDrive, Access and both Outlook variants. Existing matching
+  Office is reconfigured when its exclusion list differs. No notebooks are deleted.
+
+Use the rebuilt `tinnosdebloat-win11.exe` and its checksum from this repository;
+older downloaded executables contain older embedded scripts and catalogs.

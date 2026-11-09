@@ -3,7 +3,7 @@
 Select installations in **EQUIP GEAR** and removals/preferences in **REMOVE WASPS**.
 Checked means execute the named action; unchecked means leave it alone. Every app
 line starts with **Uninstall**, every service line with **Deactivate**. Desktop
-preferences use **Hide** or **Enable**. Teams removal can also be unchecked; Teams
+preferences use **Hide**, **Enable** or **Set**. Teams removal can also be unchecked; Teams
 is always excluded from Office regardless. The catalog uses exact package and
 service names, never a broad Microsoft or Xbox wildcard. The interface and engine
 share `debloat-catalog.json`; the upper-right jade pendant is a visual reference.
@@ -31,7 +31,7 @@ share `debloat-catalog.json`; the upper-right jade pendant is a visual reference
 | `Xbox` | Xbox apps | `Microsoft.GamingApp`, `Microsoft.XboxApp`, `Microsoft.Xbox.TCUI`, `Microsoft.XboxIdentityProvider`, `Microsoft.XboxSpeechToTextOverlay` |
 | `Weather` | Weather | `Microsoft.BingWeather` |
 
-Teams uses its separate official bootstrapper, Appx/provisioning and supported legacy uninstallers when selected. Office includes Word, Excel, PowerPoint and OneNote; **OneDrive, Access, classic Outlook and new Outlook are always excluded** from ODT. **NewOutlook** separately removes the existing Windows package `Microsoft.OutlookForWindows` when checked. Existing standalone Office products and OneDrive data are not force-deleted. Games means the listed Microsoft casual games, not arbitrary games or their documents. Copilot means the listed Store apps, not removal of Windows shell components or Microsoft 365 shared files. Legacy non-Store Quick Assist/Paint versions are outside this package-only selection.
+Teams uses its separate official bootstrapper, Appx/provisioning and supported legacy uninstallers when selected. Office includes Word, Excel and PowerPoint; **OneNote, OneDrive, Access, classic Outlook and new Outlook are always excluded** from ODT. **NewOutlook** separately removes the existing Windows package `Microsoft.OutlookForWindows` when checked. Existing standalone Office products and OneDrive data are not force-deleted. Games means the listed Microsoft casual games, not arbitrary games or their documents. Copilot means the listed Store apps, not removal of Windows shell components or Microsoft 365 shared files. The separate companion-app package is `Microsoft.M365Companions`, covering People, Files and Calendar. Legacy non-Store Quick Assist/Paint versions are outside this package-only selection.
 
 ### Why something may remain after cleanup
 
@@ -58,7 +58,7 @@ Installed packages are removed for all applicable users, and matching provisione
 ## Dell, ASUS and desktop utilities
 
 These are separate checklist entries, not a blanket vendor removal. Hardware
-drivers, ASUS System Control Interface/hotkey components, Dell Core Services,
+drivers, ASUS System Control Interface/hotkey components, unrelated Dell Core Services,
 Dell Command Update, firmware and recovery partitions are outside this list.
 Feedback Hub (Hub de comentarios) and Xbox Live were already covered by
 `FeedbackHub`, `Xbox` and `XboxServices`; they are not duplicate removals.
@@ -69,18 +69,20 @@ Feedback Hub (Hub de comentarios) and Xbox Live were already covered by
 | `DellDigitalDelivery` | Digital Delivery Store app, desktop app and Services entry | Selected |
 | `DellCustomerConnect` | Dell Customer Connect Store/desktop app | Selected |
 | `ASUSGiftbox` | ASUS GIFTBOX Store/desktop promotional app | Selected |
-| `DellOptimizer` | Dell Optimizer and Optimizer Core; affects power/performance settings | Unchecked |
+| `DellOptimizer` | Optimizer/Core/Service/UI/Precision Optimizer; affects power/performance settings | Selected |
 | `DellRecoveryHelpers` | SupportAssist Remediation and OS Recovery Plugin for Dell Update; affects OEM recovery features | Unchecked |
 | `MyASUS` | MyASUS (`B9ECED6F.ASUSPCAssistant`) and matching desktop entry; affects battery/device preferences | Unchecked |
 | `ASUSArmouryCrate` | Armoury Crate / SE app and registered service products; official complete-uninstall workflow | Unchecked |
 
 Native removal requires an exact catalog product name and expected registry
 publisher. A registered MSI product uses its product GUID with Windows Installer.
-Other desktop products need a registered `QuietUninstallString` pointing to an
-authenticode-verified Microsoft, Dell or ASUS executable under local application
-directories. Unsupported commands are not guessed or passed to a shell; they
+Desktop products use registered uninstall commands pointing to a signature-verified
+Microsoft, Dell, ASUS or McAfee executable under trusted local directories. Dell
+and McAfee can fall back to the registered interactive command when quiet mode
+is unavailable; no silent switches are guessed. Unsupported commands are not guessed or passed to a shell; they
 produce `TNO-504` and a manual removal instruction. Per-user desktop registrations
-are detected but must be uninstalled while signed into the owning account.
+require the owning account. OneDrive supports a limited-token cleanup task; other
+per-user native products are reported for removal in that account.
 Inventory errors prevent a claim of complete removal.
 
 Power Automate covers the Store app and recognized Microsoft desktop installer
@@ -145,20 +147,76 @@ These are service startup changes, equivalent to disabling the selected service 
 
 Disabling **WSearch** stops indexing and can affect Start/File Explorer and classic Outlook search speed and results; existing index files are not deleted. Xbox service changes can affect controllers, sign-in and game saves. Server/SMB, VPN, Smart Card, OpenSSH agent, biometrics, Shared PC and Remote Desktop changes can interrupt their respective work features. Disabling BDESVC affects BitLocker management; this tool never decrypts disks, disables protection or changes recovery keys. Parental Controls changes affect family controls. Higher impact service choices start unchecked in both the GUI and the sample config.
 
+Start-menu app and settings search can still work after indexing is disabled: these results are not stored in the file index ([Microsoft explanation](https://devblogs.microsoft.com/windows-search-platform/configuration-and-settings/)). A working Start search does not mean indexing is running. Select **Deactivate Windows Search indexing** under REMOVE WASPS and press **Start**. The success log must confirm `WSearch`, `State: Stopped; startup: Disabled`. You can also verify on the target PC with `Get-Service WSearch | Select-Object Name, Status, StartType`. Hiding the taskbar search box is a separate desktop preference.
+
 Group Policy service ownership and MDM enrollment are checked. Managed, unreadable or conflicting settings are skipped with `TNO-202`; apply them centrally. Access/dependency failures are reported without forcing other services to stop. The tool does not disable Defender, Windows Update, RPC, networking or arbitrary background processes. To undo a service change, use `services.msc` and the previous startup mode recorded in this session, or a verified System Restore point.
 
-## Desktop, taskbar and dark mode
+## Desktop, taskbar and appearance
 
-| Selection ID | Setting | Scope / application |
-| --- | --- | --- |
-| `DesktopIcons` | Hide desktop items using `NoDesktop=1` | Device policy; leaves files intact; sign out/in |
-| `TaskbarSearch` | Hide search using `SearchOnTaskbarMode=0` | Windows 11 24H2+ policy; sign out/in |
-| `TaskbarWidgets` | Disable Widgets news/weather using `AllowNewsAndInterests=0` | Device policy; applies to the entire Widgets experience |
-| `DarkMode` | `AppsUseLightTheme=0`, `SystemUsesLightTheme=0` | Existing nonspecial local user profiles, including offline hives when accessible |
+| Selection ID | Per-profile setting |
+| --- | --- |
+| `DesktopIcons` | `Explorer\Advanced\HideIcons=1`; desktop files remain intact |
+| `TaskbarSearch` | `Search\SearchboxTaskbarMode=0`; works without the former 24H2 policy gate |
+| `TaskbarWidgets` | `Explorer\Advanced\TaskbarDa=0`; hides the Widgets/news/weather taskbar entry |
+| `DarkMode` | `AppsUseLightTheme=0`, `SystemUsesLightTheme=0` |
+| `AccentGold` | Yellow gold / Ouro Amarelo `#FFB900`; manual accent for supported Windows surfaces |
+| `BackgroundMoss` | Solid Moss / Musgo `#486860` (`72 104 96`), clears the wallpaper preference without deleting the image |
 
-All four are selected by default. Dark mode affects Windows and apps that honor the Windows preference; it cannot force every third-party app to use a dark theme. New user profiles are not given a dark-mode default by this tool. Device desktop/taskbar policies require Pro, Enterprise, Education or IoT editions; unsupported versions/editions receive `TNO-503` and can be configured manually through Windows Settings. Explorer is not force-restarted, so existing sessions may need sign-out/sign-in.
+All six are selected by default. They target existing nonspecial local user hives,
+including accessible offline profiles. They do not change the template for future
+users. The tool no longer requires Pro or 24H2 just to set user preferences.
+Effective GPO/MDM restrictions are checked per setting; existing policy values are
+never overwritten. A domain join alone is not a conflict. Inaccessible profiles
+and conflicting policies are reported, while other profiles continue.
 
-Domain-joined or MDM-enrolled devices receive `TNO-202` for these local visual settings so organization configuration can be applied centrally. Existing opposite policy values are preserved. Files are hidden, not deleted. Uncheck a visual setting before Start to leave it alone; unchecking on a later run does not undo a previous change. Restore the policy/preferences manually or use System Restore.
+A Windows shell refresh is requested for the account executing the tool. Other
+active accounts, and Explorer caches that do not respond to the refresh, require
+sign-out/sign-in. Registry verification confirms saved preferences, not every app's
+visual response. Dark mode cannot force unrelated third-party apps to use a theme.
+Final validation re-reads the saved values; it does not trust only an earlier
+Configured result. Unchecking an action leaves the current state unchanged and
+does not undo a previous change. No Explorer sessions are forcibly terminated.
+
+## Additional native removals
+
+- `DellConnectedServiceDelivery`: exact DCSD service/application and Subagent
+  product entries. The registered service uninstaller owns service teardown;
+  drivers, firmware and recovery partitions are not force-deleted. Removing only
+  the Subagent can allow the DCSD service to restore it, so both are covered.
+- `DellSupportAssist`: includes Home/Business variants and PC Analytics.
+- `DellOptimizer`: Optimizer/Core/Service/UI/Precision Optimizer; checked by default.
+- `Microsoft365Companions`: exact `Microsoft.M365Companions` Appx registrations and
+  provisioned package, plus known registered desktop names. Selected removal runs
+  again after Office. Calendar, contacts and files are not deleted from Microsoft 365.
+- `OneDrive`: exact registered Microsoft OneDrive product. An Office exclusion
+  prevents ODT inclusion but does not remove an existing sync client; this selection
+  does. Machine products use their registered uninstaller. Per-user installations
+  are queued under the owning account's limited interactive token and reported
+  Pending until a later run verifies absence. The idempotent user task runs at
+  sign-in; no user-owned executable is launched with administrator privileges.
+  Synced folders and cloud files are preserved; online-only files are not downloaded
+  or deleted by uninstalling the client. Finish any sync work before removal.
+- `McAfeeWebAdvisor`: WebAdvisor only, including the Portuguese display name;
+  other antivirus products and browser profiles are left alone. A McAfee prompt
+  can appear if the registered uninstaller has no quiet mode. No general MCPR
+  removal of the entire security suite is attempted.
+- `RemoteDesktopConnection`: checked by default and still uses Microsoft's
+  `mstsc.exe /uninstall` on Windows 11 23H2+. Complete the visible Windows prompt;
+  choose restart later and restart afterward if requested. No unsupported silent
+  switches or automatic reboot are used, and saved `.rdp` files remain intact.
+
+Native removal requires an exact product name and matching publisher. MSI entries
+use their registered product GUID; EXE uninstallers require a valid vendor
+signature and a trusted local application path. Dell/McAfee may use their
+registered interactive command if no quiet one exists. A locked user hive no
+longer prevents trying machine-wide removal, but absence remains unverified if
+that profile cannot be inspected. No leftover entry is reported as removed.
+
+References: [Dell DCSD lifecycle](https://www.dell.com/support/kbdoc/en-us/000367384/dell-connected-service-delivery-reinstallation-after-removal),
+[Microsoft companion removal](https://learn.microsoft.com/en-us/microsoft-365-apps/companions/companion-app-retirement),
+[Remote Desktop Connection removal](https://learn.microsoft.com/en-us/windows-server/remote/remote-desktop-services/remotepc/uninstall-remote-desktop-connection),
+[ODT exclusion IDs](https://learn.microsoft.com/en-us/microsoft-365-apps/deploy/office-deployment-tool-configuration-options),
+[WebAdvisor removal](https://www.mcafee.com/support/s/article/000001669?language=en_US).
 
 ## Downloads and failure handling
 
