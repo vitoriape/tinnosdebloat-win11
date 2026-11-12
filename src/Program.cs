@@ -14,7 +14,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("TinnosDebloat-Win11")]
 [assembly: AssemblyDescription("Windows 11 provisioning and Teams removal")]
-[assembly: AssemblyVersion("2.5.0.0")]
+[assembly: AssemblyVersion("2.6.0.0")]
 
 namespace TinnosDebloat
 {
@@ -178,29 +178,11 @@ namespace TinnosDebloat
         public static Form Create() { return new MainForm(); }
     }
 
-    internal sealed class JadePendant : Control
-    {
-        public JadePendant() { Name = "jadePendant"; AccessibleName = "Jade pendant reference"; Size = new Size(34, 38);
-            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true); }
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            base.OnPaint(e); e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            using (Pen gold = new Pen(Color.FromArgb(218, 180, 103), 1.5f))
-            using (Pen engraving = new Pen(Color.FromArgb(156, 225, 176), 1.2f))
-            using (SolidBrush jade = new SolidBrush(Color.FromArgb(35, 117, 83))) {
-                e.Graphics.DrawEllipse(gold, 13, 2, 8, 9);
-                Point[] stone = { new Point(17, 9), new Point(29, 20), new Point(23, 33), new Point(11, 33), new Point(5, 20) };
-                e.Graphics.FillPolygon(jade, stone); e.Graphics.DrawPolygon(gold, stone);
-                e.Graphics.DrawLines(engraving, new Point[] { new Point(11, 19), new Point(21, 19), new Point(21, 25), new Point(14, 25), new Point(14, 29) });
-            }
-        }
-    }
-
     internal sealed class MainForm : Form
     {
-        private static readonly Color Background = Color.FromArgb(23, 29, 35);
-        private static readonly Color Surface = Color.FromArgb(38, 46, 54);
-        private static readonly Color Accent = Color.FromArgb(218, 180, 103);
+        private static readonly Color Background = Color.FromArgb(17, 23, 27);
+        private static readonly Color Surface = Color.FromArgb(29, 39, 43);
+        private static readonly Color Accent = Color.FromArgb(245, 195, 58);
         private readonly CheckedListBox equipment = new CheckedListBox { Name = "installList", Dock = DockStyle.Fill,
             CheckOnClick = true, HorizontalScrollbar = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
         private readonly Button start = ActionButton("Start");
@@ -211,6 +193,9 @@ namespace TinnosDebloat
             WordWrap = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
         private readonly CheckedListBox cleanup = new CheckedListBox { Name = "removalList", Dock = DockStyle.Fill, Height = 190,
             CheckOnClick = true, HorizontalScrollbar = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
+        private readonly ComboBox deviceType = new ComboBox { Name = "deviceType", DropDownStyle = ComboBoxStyle.DropDownList, Width = 125 };
+        private readonly ComboBox manufacturer = new ComboBox { Name = "manufacturer", DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
+        private readonly Dictionary<string, bool> cleanupSelection = new Dictionary<string, bool>();
         private readonly List<CleanupItem> cleanupItems = new List<CleanupItem>();
         private readonly HashSet<string> displayedIssues = new HashSet<string>();
         private readonly TabControl detailTabs = new TabControl { Name = "detailTabs", Dock = DockStyle.Fill, Visible = false };
@@ -221,42 +206,59 @@ namespace TinnosDebloat
         private bool receivedResult;
         private string primaryCode = "";
         private sealed class CleanupItem {
-            public string Id, Label;
+            public string Id, Label, Vendor; public bool DefaultSelected;
             public override string ToString() { return Label; }
         }
 
         public MainForm()
         {
             Text = "TinnosDebloat-Win11"; BackColor = Background; ForeColor = Color.White;
-            Font = new Font("Segoe UI", 10); ClientSize = new Size(940, 550); MinimumSize = new Size(816, 540);
+            Font = new Font("Segoe UI", 10); ClientSize = new Size(1100, 700); MinimumSize = new Size(1000, 680);
+            using (Stream icon = Assembly.GetExecutingAssembly().GetManifestResourceStream("Brand.app.ico")) Icon = new Icon(icon);
             StartPosition = FormStartPosition.CenterScreen;
             TableLayoutPanel layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(22), ColumnCount = 1, RowCount = 6 };
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 310));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 420));
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 5));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             TableLayoutPanel header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
-            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 36));
-            header.Controls.Add(new Label { Text = "Marked = execute the action. Unmarked = leave unchanged.", AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Color.Gainsboro });
-            header.Controls.Add(new JadePendant { Anchor = AnchorStyles.Top | AnchorStyles.Right }); layout.Controls.Add(header);
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 88)); header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            PictureBox emblem = new PictureBox { Name = "brandEmblem", SizeMode = PictureBoxSizeMode.Zoom, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 16, 12) };
+            using (Stream image = Assembly.GetExecutingAssembly().GetManifestResourceStream("Brand.emblem.png")) emblem.Image = new Bitmap(image);
+            header.Controls.Add(emblem);
+            FlowLayoutPanel heading = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+            heading.Controls.Add(new Label { Text = "TINNOS / DEBLOAT", AutoSize = true, Font = new Font("Segoe UI Semibold", 22), ForeColor = Accent });
+            heading.Controls.Add(CreateHelpButton("selectionHelp", "How selections work", "Checked = execute the action. Unchecked = leave unchanged. Review your selections, then click Start. Details shows the live log and any errors."));
+            header.Controls.Add(heading); layout.Controls.Add(header);
             equipment.Items.Add(new CleanupItem { Id = "GoogleDrive", Label = "Install Google Drive" }, true);
             equipment.Items.Add(new CleanupItem { Id = "Office", Label = "Install Microsoft 365 Office" }, true);
             equipment.Items.Add(new CleanupItem { Id = "Chrome", Label = "Install Google Chrome" }, true);
             TableLayoutPanel choices = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
             choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36)); choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 64));
             choices.Controls.Add(ActionSection("EQUIP GEAR", equipment, "Office: PT-BR, 64-bit. Word, Excel, PowerPoint. Teams, OneNote, OneDrive, Access and Outlook excluded."));
-            choices.Controls.Add(ActionSection("REMOVE WASPS", cleanup, "Uninstall = remove app. Deactivate = stop and disable service. Windows may require sign-out or restart."));
+            deviceType.Items.AddRange(new object[] { "Desktop", "Laptop" });
+            manufacturer.Items.AddRange(new object[] { "Other / None", "ASUS", "Dell" });
+            deviceType.SelectedIndex = 0; manufacturer.SelectedIndex = 0; manufacturer.Enabled = false;
+            TableLayoutPanel wasps = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Margin = Padding.Empty };
+            wasps.RowStyles.Add(new RowStyle(SizeType.Absolute, 48)); wasps.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            wasps.Controls.Add(Row(new Label { Text = "Device", AutoSize = true, Padding = new Padding(0, 5, 5, 0) }, deviceType,
+                new Label { Text = "Brand", AutoSize = true, Padding = new Padding(10, 5, 5, 0) }, manufacturer));
+            wasps.Controls.Add(cleanup);
+            choices.Controls.Add(ActionSection("REMOVE WASPS", wasps, "Uninstall removes an app. Deactivate stops and disables a service. Windows may require sign-out or restart.\n\nDesktop excludes ASUS and Dell utilities. For a laptop, choose its brand to select matching utilities. Review these before Start: some affect battery settings or recovery. Armoury Crate requires ASUS's official uninstall tool.\n\nFull Search UI blocking requires updated Windows 11 Pro or higher and a restart. Indexing is a separate action."));
             layout.Controls.Add(choices);
             using (Stream data = Assembly.GetExecutingAssembly().GetManifestResourceStream("Payload.debloat-catalog.json"))
             using (StreamReader reader = new StreamReader(data)) {
                 foreach (object entry in (object[])ResultChannel.Serializer().DeserializeObject(reader.ReadToEnd())) {
                     Dictionary<string, object> item = (Dictionary<string, object>)entry;
-                    CleanupItem choice = new CleanupItem { Id = TextValue(item, "Id"), Label = TextValue(item, "Name") };
-                    cleanupItems.Add(choice); cleanup.Items.Add(choice, !(Value(item, "DefaultSelected") is bool) || (bool)Value(item, "DefaultSelected"));
+                    CleanupItem choice = new CleanupItem { Id = TextValue(item, "Id"), Label = TextValue(item, "Name"), Vendor = TextValue(item, "Vendor"), DefaultSelected = !(Value(item, "DefaultSelected") is bool) || (bool)Value(item, "DefaultSelected") };
+                    cleanupItems.Add(choice); cleanupSelection[choice.Id] = choice.Vendor == "Dell" || choice.Vendor == "ASUS" || choice.DefaultSelected;
                 }
             }
+            RefreshCleanup();
+            deviceType.SelectedIndexChanged += delegate { manufacturer.Enabled = deviceType.SelectedIndex == 1; RefreshCleanup(); };
+            manufacturer.SelectedIndexChanged += delegate { RefreshCleanup(); };
             start.Width = 300; details.Width = 140; details.Name = "detailsButton"; start.Name = "startButton";
             layout.Controls.Add(ActionRow(details, start));
             layout.Controls.Add(status); layout.Controls.Add(progress);
@@ -272,11 +274,25 @@ namespace TinnosDebloat
                 if (running != null) { e.Cancel = true; status.Text = "An operation is running. Wait for the result."; }
             };
         }
+        private void RefreshCleanup()
+        {
+            for (int i = 0; i < cleanup.Items.Count; i++) {
+                CleanupItem item = (CleanupItem)cleanup.Items[i]; cleanupSelection[item.Id] = cleanup.GetItemChecked(i);
+            }
+            cleanup.BeginUpdate(); cleanup.Items.Clear();
+            string vendor = deviceType.SelectedIndex == 1 ? Convert.ToString(manufacturer.SelectedItem) : "";
+            foreach (CleanupItem item in cleanupItems) {
+                bool oem = item.Vendor == "Dell" || item.Vendor == "ASUS";
+                if (oem && item.Vendor != vendor) continue;
+                cleanup.Items.Add(item, cleanupSelection[item.Id]);
+            }
+            cleanup.EndUpdate();
+        }
         private void SetDetails(bool show)
         {
             detailTabs.Visible = show;
             int availableHeight = Screen.FromControl(this).WorkingArea.Height - SystemInformation.CaptionHeight - 32;
-            ClientSize = new Size(ClientSize.Width, Math.Min(availableHeight, show ? 820 : 550));
+            ClientSize = new Size(ClientSize.Width, Math.Min(availableHeight, show ? 940 : 700));
         }
         private static Button ActionButton(string text)
         {
@@ -289,16 +305,32 @@ namespace TinnosDebloat
             FlowLayoutPanel panel = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = Padding.Empty };
             panel.Controls.AddRange(controls); return panel;
         }
+        private static Button CreateHelpButton(string name, string title, string guidance)
+        {
+            Button button = ActionButton("?");
+            button.Name = name; button.AccessibleName = title + " help";
+            button.AccessibleDescription = guidance;
+            button.Size = new Size(28, 28); button.Margin = new Padding(0, 0, 0, 8);
+            button.Font = new Font("Segoe UI", 10, FontStyle.Bold);
+            button.ForeColor = Accent; button.FlatAppearance.BorderSize = 0;
+            button.FlatAppearance.MouseOverBackColor = Color.FromArgb(49, 63, 67);
+            button.Click += delegate { MessageBox.Show(button.FindForm(), guidance, title,
+                MessageBoxButtons.OK, MessageBoxIcon.Information); };
+            return button;
+        }
         private static Control ActionSection(string title, Control content, string note)
         {
             TableLayoutPanel card = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface,
-                Padding = new Padding(12), Margin = new Padding(0, 0, 0, 12), ColumnCount = 1 };
-            card.RowStyles.Add(new RowStyle(SizeType.AutoSize)); card.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); card.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
-            card.Controls.Add(new Label { Text = title, AutoSize = true, ForeColor = Color.FromArgb(167, 181, 194),
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), Margin = new Padding(0, 0, 0, 8) });
-            card.Controls.Add(content);
-            if (note != null) card.Controls.Add(new Label { Text = note, Dock = DockStyle.Fill, ForeColor = Color.FromArgb(167, 181, 194),
-                Font = new Font("Segoe UI", 8.5f), Margin = new Padding(0, 8, 0, 0) });
+                Padding = new Padding(12), Margin = new Padding(0, 0, 10, 12), ColumnCount = 1, RowCount = 2 };
+            card.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+            card.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            TableLayoutPanel heading = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
+            heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            heading.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 30));
+            heading.Controls.Add(new Label { Text = title, AutoSize = true, ForeColor = Color.FromArgb(167, 181, 194),
+                Font = new Font("Segoe UI", 10f, FontStyle.Bold), Margin = new Padding(0, 4, 0, 0) });
+            if (note != null) heading.Controls.Add(CreateHelpButton(title == "EQUIP GEAR" ? "gearHelp" : "waspsHelp", title, note));
+            card.Controls.Add(heading); card.Controls.Add(content);
             return card;
         }
         private static Control ActionRow(Control left, Control right)
@@ -326,7 +358,8 @@ namespace TinnosDebloat
         }
         private void Busy(bool busy)
         {
-            foreach (Control item in new Control[] { equipment, cleanup, start }) item.Enabled = !busy;
+            foreach (Control item in new Control[] { equipment, cleanup, start, deviceType, manufacturer }) item.Enabled = !busy;
+            manufacturer.Enabled = !busy && deviceType.SelectedIndex == 1;
             progress.Style = busy ? ProgressBarStyle.Marquee : ProgressBarStyle.Blocks;
         }
         public string SelectedConfiguration()

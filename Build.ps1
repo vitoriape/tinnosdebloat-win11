@@ -11,6 +11,9 @@ $arguments=@('/nologo','/target:winexe','/platform:x64','/optimize+',
 foreach ($name in @('Invoke-Provisioning.ps1','Invoke-UserCleanup.ps1','Provisioning.psm1','Check-OfficeActivation.ps1','config.example.json','error-codes.json','debloat-catalog.json')) {
     $arguments += "/resource:$PSScriptRoot\$name,Payload.$name"
 }
+$arguments += "/win32icon:$PSScriptRoot\assets\app.ico"
+$arguments += "/resource:$PSScriptRoot\assets\app.ico,Brand.app.ico"
+$arguments += "/resource:$PSScriptRoot\assets\emblem.png,Brand.emblem.png"
 $arguments += "$PSScriptRoot\src\Program.cs"
 & $compiler @arguments
 if ($LASTEXITCODE -ne 0) { throw "C# compilation failed: $LASTEXITCODE" }

@@ -121,3 +121,60 @@ Test 'McAfee WebAdvisor MSI removal checks publisher and absence (mocked)' {
     }
     try {Assert ((Remove-DesktopUtility McAfeeWebAdvisor).Status -eq 'Removed') 'WebAdvisor removal not verified.'} finally {Reset-Engine}
 }
+Test 'Search UI blocking verifies policy, requires restart and rejects unsupported systems (mocked)' {
+    $module=Get-Module Provisioning
+    try {
+        & $module {
+            $script:Report=[pscustomobject]@{RebootRequired=$false}
+            $script:SearchValue=0
+            function script:Assert-SearchUiSupport {}
+            function script:Set-VerifiedDword($Path,$Name,$Value,[switch]$Policy) {
+                if ($Name -ne 'DisableSearch' -or $Value -ne 1 -or !$Policy) {throw 'Wrong Search policy'}
+                $script:SearchValue=$Value
+            }
+            function script:Test-Path { $true }
+            function script:Get-ItemProperty {[pscustomobject]@{DisableSearch=$script:SearchValue}}
+        }
+        $result=Set-SelectedDesktopSetting DisableSearchUI
+        Assert ($result.Status -eq 'Configured' -and (Test-DesktopSettingState DisableSearchUI)) 'Search UI policy not verified.'
+        Assert (& $module {$script:Report.RebootRequired}) 'Restart requirement lost.'
+        & $module {$script:SearchValue=0}
+        Assert (!(Test-DesktopSettingState DisableSearchUI)) 'Reverted Search policy passed.'
+        & $module {function script:Assert-SearchUiSupport {throw 'Unsupported Windows'}}
+        Throws {Set-SelectedDesktopSetting DisableSearchUI}
+    } finally {Reset-Engine}
+}
+Test 'Bing and Media Player defaults remove exact installed and provisioned packages and reject leftovers (mocked)' {
+    $catalog=Get-Content -LiteralPath (Join-Path $root 'debloat-catalog.json') -Raw | ConvertFrom-Json
+    foreach ($pair in @(@('Bing','Microsoft.BingSearch'),@('MediaPlayer','Microsoft.ZuneMusic'))) {
+        Assert ($pair[0] -in $config.RemoveItems) 'New app missing from defaults.'
+        Assert (@(($catalog | Where-Object Id -eq $pair[0]).Packages).Count -eq 1 -and ($catalog | Where-Object Id -eq $pair[0]).Packages[0] -eq $pair[1]) 'Wrong exact package mapping.'
+        $module=Get-Module Provisioning
+        try {
+            & $module {
+                param($Name)
+                $script:FixtureName=$Name; $script:AppGone=$false; $script:ProvisionGone=$false; $script:KeepApp=$false; $script:BackedUp=$false
+                $script:Report=[pscustomobject]@{RebootRequired=$false;Issues=@()}
+                function script:Get-AppxPackage {
+                    if (!$script:AppGone) {[pscustomobject]@{Name=$script:FixtureName;PackageFullName='fixture-app';IsFramework=$false;NonRemovable=$false}}
+                    [pscustomobject]@{Name='Unrelated.App';PackageFullName='unrelated';IsFramework=$false;NonRemovable=$false}
+                }
+                function script:Get-AppxProvisionedPackage {if (!$script:ProvisionGone) {[pscustomobject]@{DisplayName=$script:FixtureName;PackageName='fixture-provision'}}}
+                function script:Backup-SelectedAppData {$script:BackedUp=$true}
+                function script:Remove-AppxPackage {
+                    param($Package,[switch]$AllUsers)
+                    if (!$script:BackedUp -or $Package -ne 'fixture-app' -or !$AllUsers) {throw 'Unsafe app removal'}
+                    $script:AppGone=!$script:KeepApp
+                }
+                function script:Remove-AppxProvisionedPackage {
+                    param([switch]$Online,$PackageName,[switch]$AllUsers)
+                    if ($PackageName -ne 'fixture-provision' -or !$Online -or !$AllUsers) {throw 'Unsafe provisioning removal'}
+                    $script:ProvisionGone=$true; [pscustomobject]@{RestartNeeded=$false}
+                }
+            } $pair[1]
+            Assert ((Remove-SelectedApp $pair[1] $work).Status -eq 'Removed') 'App removal failed.'
+            & $module {$script:AppGone=$false;$script:KeepApp=$true}
+            Throws {Remove-SelectedApp $pair[1] $work}
+        } finally {Reset-Engine}
+    }
+}

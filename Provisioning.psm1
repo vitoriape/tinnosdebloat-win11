@@ -1314,7 +1314,25 @@ public static class TinnosDesktopNative {
     [TinnosDesktopNative]::SHChangeNotify(0x08000000,0,[IntPtr]::Zero,[IntPtr]::Zero)
 }
 
+function Assert-SearchUiSupport {
+    $version=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+    $build=[int]$version.CurrentBuildNumber
+    if ($version.EditionID -notmatch '^(Professional|Enterprise|Education|IoTEnterprise)' -or $build -lt 26100 -or ($build -eq 26100 -and [int]$version.UBR -lt 4770)) {
+        throw (New-TinnosError 'TNO-503' 'Fully disabling Search UI requires Windows 11 Pro/Enterprise/Education 24H2 with KB5062660 or newer. Update Windows, then retry. Indexing is a separate action.')
+    }
+    $mdm='HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Search'
+    if (Test-Path -LiteralPath $mdm) {
+        $value=Get-Value (Get-ItemProperty -LiteralPath $mdm -ErrorAction Stop) 'DisableSearch'
+        if ($null -ne $value -and [int]$value -ne 1) {throw (New-TinnosError 'TNO-202' 'An assigned MDM policy enables Search UI. Change that policy centrally.')}
+    }
+}
+
 function Test-DesktopSettingState([string]$Setting) {
+    if ($Setting -eq 'DisableSearchUI') {
+        Assert-SearchUiSupport
+        $path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'
+        return (Test-Path -LiteralPath $path) -and (Get-Value (Get-ItemProperty -LiteralPath $path -ErrorAction Stop) 'DisableSearch') -eq 1
+    }
     $profiles=@(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object {!$_.Special})
     if (!$profiles.Count) {return $false}
     foreach ($profile in $profiles) {
@@ -1333,7 +1351,15 @@ function Test-DesktopSettingState([string]$Setting) {
     return $true
 }
 
-function Set-SelectedDesktopSetting([ValidateSet('DesktopIcons','TaskbarSearch','TaskbarWidgets','DarkMode','AccentGold','BackgroundMoss')][string]$Setting) {
+function Set-SelectedDesktopSetting([ValidateSet('DesktopIcons','TaskbarSearch','TaskbarWidgets','DarkMode','AccentGold','BackgroundMoss','DisableSearchUI')][string]$Setting) {
+    if ($Setting -eq 'DisableSearchUI') {
+        Assert-SearchUiSupport
+        Set-VerifiedDword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'DisableSearch' 1 -Policy
+        if (!(Test-DesktopSettingState $Setting)) {throw (New-TinnosError 'TNO-503' 'Search UI policy verification failed.')}
+        $script:Report.RebootRequired=$true
+        return [pscustomobject]@{Status='Configured';Setting=$Setting;Apply='Policy verified; restart Windows to apply Search UI blocking. Search binaries are preserved.'}
+    }
+
     $profiles=@(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object {!$_.Special})
     if (!$profiles.Count) {throw (New-TinnosError 'TNO-503' 'No applicable local profiles found.')}
     $failed=$false; $applied=@()

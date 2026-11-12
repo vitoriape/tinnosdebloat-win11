@@ -542,3 +542,16 @@ Developed by [Vitória Peçanha](https://github.com/vitoriape).
 
 Use the rebuilt `tinnosdebloat-win11.exe` and its checksum from this repository;
 older downloaded executables contain older embedded scripts and catalogs.
+
+## Interface and cleanup update (2.6)
+
+The supplied Golden Compass Raider emblem appears in the header, window, taskbar and executable. Source artwork and the multi-resolution Windows icon live in `assets/`.
+
+REMOVE WASPS now starts in Desktop mode, excluding Dell and ASUS actions. Laptop mode enables Other / None, ASUS and Dell. Choosing a vendor checks its catalog utilities, including MyASUS and Dell recovery helpers; review the list before Start because these can affect battery settings and recovery. Only that vendor is included in the generated configuration. Unknown products and drivers are not removed by broad name matching. Armoury Crate still reports the official complete uninstall-tool requirement rather than claiming a partial removal succeeded. CLI configurations continue to use explicit RemoveItems and are independent of GUI filtering.
+
+Windows Search has separate indexing and full Search UI actions. Full blocking uses Microsoft's DisableSearch policy, with indexing stopped separately. It requires updated Windows 11 Pro/Enterprise/Education 24H2 (KB5062660, build 26100.4770) or newer and a restart. Unsupported editions/builds and conflicting existing policies are reported as errors. Verification proves the policy value, not that the currently running shell has reloaded it. After restarting, confirm Win+S and Start typing no longer open Search. Protected Windows binaries are preserved.
+
+Policy reference: https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-search#disablesearch
+To restore Search UI, remove the DisableSearch value at HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search and restart (or change the centrally assigned policy). To restore indexing, set WSearch back to its prior startup mode and start the service.
+
+Bing and Media Player cleanup: `Bing` removes the exact `Microsoft.BingSearch` app package; `MediaPlayer` removes `Microsoft.ZuneMusic` (Reprodutor Multimidia / modern Media Player, formerly Groove). Both are checked by default and included in the example CLI configuration. Movies & TV (`Microsoft.ZuneVideo`) remains a separate selection. These use existing all-user and provisioned-package removal with app-data backup and final absence verification. Media files outside app data are not targeted. Bing websites, Edge search-engine preferences and legacy Windows Media Player are separate from these Store apps.

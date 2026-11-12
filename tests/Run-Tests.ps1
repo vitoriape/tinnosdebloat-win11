@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version 2.0
 $root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -801,12 +801,12 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
             $gear=$form.Controls.Find('installList',$true)[0]
             Assert ($gear.Items.Count -eq 3 -and $gear.CheckedItems.Count -eq 3) 'Equipment choices missing.'
             $choices=$form.Controls.Find('removalList',$true)[0]
-            Assert ($choices.Items.Count -eq (Get-Content (Join-Path $root 'debloat-catalog.json') -Raw | ConvertFrom-Json).Count) 'Removal choices differ from the engine catalog.'
+            Assert ($choices.Items.Count -eq @((Get-Content (Join-Path $root 'debloat-catalog.json') -Raw | ConvertFrom-Json) | Where-Object {$_.PSObject.Properties['Vendor'] -eq $null -or $_.Vendor -notin @('Dell','ASUS')}).Count) 'Removal choices differ from the engine catalog.'
             Assert ($choices.CheckedItems.Count -lt $choices.Items.Count) 'High impact services must require selection.'
             $choices.SetItemChecked(0,$false)
             Assert (!$choices.GetItemChecked(0)) 'Unchecked Teams cannot be kept.'
-            foreach($item in $choices.Items) {Assert ($item.ToString() -match '^(Uninstall|Deactivate|Hide|Enable|Set) ') ('Ambiguous action label: '+$item)}
-            Assert ($form.Controls.Find('jadePendant',$true).Count -eq 1) 'Jade reference missing.'
+            foreach($item in $choices.Items) {Assert ($item.ToString() -match '^(Uninstall|Deactivate|Hide|Enable|Set|Fully disable) ') ('Ambiguous action label: '+$item)}
+            Assert ($form.Controls.Find('brandEmblem',$true).Count -eq 1) 'Emblem missing.'
             for($i=0;$i -lt $choices.Items.Count;$i++) {$choices.SetItemChecked($i,$false)}
             for($i=0;$i -lt $gear.Items.Count;$i++) {$gear.SetItemChecked($i,$false)}
             $gear.SetItemChecked(0,$true)
@@ -815,9 +815,23 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
             Assert ($null -eq $selected.PSObject.Properties['IncludeAccess'] -and $null -eq $selected.PSObject.Properties['AppMode']) 'Removed configuration options still generated.'
             Assert ($form.Controls.Find('detailTabs',$true)[0].TabPages.Count -eq 2) 'Results tab remains.'
             $actions=@($controls | Where-Object {$_ -is [Windows.Forms.Button]})
-            Assert ($actions.Count -eq 2 -and 'Start' -in $actions.Text -and 'Details' -in $actions.Text) 'Unexpected action buttons.'
+            Assert ($actions.Count -eq 5 -and 'Start' -in $actions.Text -and 'Details' -in $actions.Text)  'Unexpected action buttons.'
+            foreach ($name in @('selectionHelp','gearHelp','waspsHelp')) {
+                $help=$form.Controls.Find($name,$true)[0]
+                Assert ($help.Text -eq '?' -and $help.AccessibleDescription.Length -gt 30) 'Contextual help guidance missing.'
+            }
             Assert (!@($controls | Where-Object {($_ -is [Windows.Forms.CheckBox] -or $_ -is [Windows.Forms.Button]) -and $_.Text -match 'PT-BR|English|Audit|reports'}).Count) 'Removed control still exists.'
-            Assert (!@($controls | Where-Object {$_ -is [Windows.Forms.ComboBox]}).Count) 'License or update dropdown remains.'
+            Assert (@($controls | Where-Object {$_ -is [Windows.Forms.ComboBox]}).Count -eq 2) 'Device selectors missing.'
+            $device=$form.Controls.Find('deviceType',$true)[0]; $vendor=$form.Controls.Find('manufacturer',$true)[0]
+            $device.SelectedIndex=1; $vendor.SelectedIndex=1
+            $selected=$form.SelectedConfiguration() | ConvertFrom-Json
+            Assert ('MyASUS' -in $selected.RemoveItems -and 'ASUSArmouryCrate' -in $selected.RemoveItems -and 'DellSupportAssist' -notin $selected.RemoveItems) 'ASUS scope failed.'
+            $vendor.SelectedIndex=2
+            $selected=$form.SelectedConfiguration() | ConvertFrom-Json
+            Assert ('DellSupportAssist' -in $selected.RemoveItems -and 'DellRecoveryHelpers' -in $selected.RemoveItems -and 'MyASUS' -notin $selected.RemoveItems) 'Dell scope failed.'
+            $device.SelectedIndex=0
+            $selected=$form.SelectedConfiguration() | ConvertFrom-Json
+            Assert ('DellSupportAssist' -notin $selected.RemoveItems -and 'MyASUS' -notin $selected.RemoveItems -and !$vendor.Enabled) 'Desktop OEM cleanup leaked.'
             Assert (!@($controls | Where-Object {$_.Text -match 'ODT|Browse|Enterprise'}).Count) 'Installer picker or Enterprise selection remains.'
         } finally {$form.Dispose()}
     }
@@ -857,6 +871,8 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
         $compiler=Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
         $arguments=@('/nologo','/target:winexe','/platform:x64','/main:TinnosDebloat.StartupProbe',"/out:$probe",'/reference:System.Windows.Forms.dll','/reference:System.Drawing.dll','/reference:System.Web.Extensions.dll')
         foreach($file in [TinnosDebloat.Payload]::Files) {$arguments+="/resource:$root\$file,Payload.$file"}
+        $arguments+="/resource:$root\assets\app.ico,Brand.app.ico"
+        $arguments+="/resource:$root\assets\emblem.png,Brand.emblem.png"
         $arguments+=(Join-Path $root 'src\Program.cs');$arguments+=(Join-Path $root 'tests\StartupProbe.cs')
         & $compiler @arguments
         Assert ($LASTEXITCODE -eq 0) 'Startup fixture compilation failed.'
