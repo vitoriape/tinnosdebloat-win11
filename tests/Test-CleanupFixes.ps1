@@ -198,8 +198,7 @@ Test 'Optional ASUS, AMD and CryptSvc actions use exact service names and are ne
         $form.Controls.Find('manufacturer',$true)[0].SelectedIndex=1
         $selected=$form.SelectedConfiguration() | ConvertFrom-Json
         foreach ($id in $expected.Keys) {Assert ($id -notin $selected.RemoveItems) ('GUI preselected optional service: '+$id)}
-        $choices=$form.Controls.Find('removalList',$true)[0]
-        for($i=0;$i -lt $choices.Items.Count;$i++) {if($choices.Items[$i].ToString() -like 'Deactivate ASUS System Diagnosis*') {$choices.SetItemChecked($i,$true)}}
+        $form.SetCleanupChecked('ASUSSystemDiagnosis',$true)
         $selected=$form.SelectedConfiguration() | ConvertFrom-Json
         Assert ('ASUSSystemDiagnosis' -in $selected.RemoveItems) 'Explicit service selection lost.'
         $form.Controls.Find('deviceType',$true)[0].SelectedIndex=0
@@ -233,13 +232,13 @@ Test 'Personalization pickers serialize independent image selections and clear w
     $form=[TinnosDebloat.Ui]::Create()
     try {
         $gear=$form.Controls.Find('installList',$true)[0]
-        Assert ($gear.Items[3].ToString() -eq 'Install TranslucentTB' -and !$gear.GetItemChecked(3)) 'TranslucentTB option/default missing.'
+        Assert ($gear.Items[3].ToString() -eq 'TranslucentTB' -and !$gear.GetItemChecked(3)) 'TranslucentTB option/default missing.'
         $gear.SetItemChecked(3,$true)
         $form.SetImageSelections('C:\Images\desktop.png','C:\Images\lock.jpg')
         $selected=$form.SelectedConfiguration() | ConvertFrom-Json
         Assert ('TranslucentTB' -in $selected.InstallItems -and $selected.WallpaperPath -eq 'C:\Images\desktop.png' -and $selected.LockScreenPath -eq 'C:\Images\lock.jpg') 'Selections not serialized.'
-        $clear=$form.Controls.Find('clearImagesButton',$true)[0]
-        $clear.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($clear,@([EventArgs]::Empty)) | Out-Null
+        $gear.SetItemChecked(4,$false)
+        $gear.SetItemChecked(5,$false)
         $selected=$form.SelectedConfiguration() | ConvertFrom-Json
         Assert ($null -eq $selected.PSObject.Properties['WallpaperPath'] -and $null -eq $selected.PSObject.Properties['LockScreenPath']) 'Cleared images would still apply.'
     } finally {$form.Dispose()}
@@ -364,4 +363,76 @@ Test 'Empty Start layout is optional, preserves apps and fails on conflicting po
         & $module {function script:Assert-StartMenuSupport {throw 'Unsupported Windows'}}
         Throws {Assert-LocalDesktopSettings EmptyStartMenu 'HKCU:'}
     } finally {Reset-Engine}
+}
+Test 'Wallpaper checklist reopens picker after unchecking, confirms shared lock image and handles cancellation' {
+    $file=Join-Path $work 'checklist-wallpaper.png';$bitmap=New-Object Drawing.Bitmap(16,12)
+    try {$bitmap.Save($file,[Drawing.Imaging.ImageFormat]::Png)} finally {$bitmap.Dispose()}
+    $state=[pscustomobject]@{Picks=0;Confirms=0;Cancel=$false;Share=$true;File=$file;LockPicks=0}
+    $form=[TinnosDebloat.Ui]::Create()
+    try {
+        $form.ImagePicker=[Func[bool,string]]({param($isLock);$state.Picks++;if($isLock){$state.LockPicks++};if($state.Cancel){return $null};return $state.File}.GetNewClosure())
+        $form.ConfirmLockScreen=[Func[bool]]({$state.Confirms++;return $state.Share}.GetNewClosure())
+        $gear=$form.Controls.Find('installList',$true)[0]
+        $gear.SetItemChecked(4,$true)
+        $selected=$form.SelectedConfiguration() | ConvertFrom-Json
+        Assert ($state.Picks -eq 1 -and $state.Confirms -eq 1 -and $gear.GetItemChecked(5)) 'Shared wallpaper flow did not confirm exactly once.'
+        Assert ($selected.WallpaperPath -eq $file -and $selected.LockScreenPath -eq $file -and 'Wallpaper' -notin $selected.InstallItems -and 'LockScreen' -notin $selected.InstallItems) 'Image selections became application installs.'
+        $preview=$form.Controls.Find('desktopPreview',$true)[0]
+        Assert ($preview.WallpaperPath -eq $file) 'Wallpaper preview is stale.'
+        $gear.SetItemChecked(4,$false)
+        $selected=$form.SelectedConfiguration() | ConvertFrom-Json
+        Assert (!$gear.GetItemChecked(5) -and $null -eq $selected.PSObject.Properties['WallpaperPath'] -and $null -eq $selected.PSObject.Properties['LockScreenPath']) 'Unchecking retained linked image changes.'
+        Assert ($preview.WallpaperPath -eq '') 'Preview retained unchecked wallpaper.'
+        $gear.SetItemChecked(4,$true)
+        Assert ($state.Picks -eq 2 -and $state.Confirms -eq 2) 'Rechecking reused an old selection without reopening the picker.'
+        $gear.SetItemChecked(4,$false);$state.Cancel=$true
+        $gear.SetItemChecked(4,$true)
+        Assert (!$gear.GetItemChecked(4) -and $state.Picks -eq 3 -and $state.Confirms -eq 2) 'Cancelled picker left the item checked or opened confirmation.'
+        $state.Cancel=$false;$state.Share=$false
+        $gear.SetItemChecked(4,$true)
+        Assert (!$gear.GetItemChecked(5) -and $state.Confirms -eq 3) 'No response still selected lock screen.'
+        $gear.SetItemChecked(5,$true)
+        Assert ($state.LockPicks -eq 1 -and $state.Confirms -eq 3) 'Independent lock-screen option did not open its own picker.'
+    } finally {$form.Dispose()}
+}
+Test 'Both select-all and clear-all controls include collapsed sections but exclude hidden manufacturers' {
+    $form=[TinnosDebloat.Ui]::Create()
+    try {
+        $form.SetCleanupSectionExpanded('Apps',$false);$form.SetCleanupSectionExpanded('Services',$false)
+        $form.SelectAllCleanup($true)
+        $selected=$form.SelectedConfiguration() | ConvertFrom-Json
+        Assert ($selected.RemoveItems.Count -eq $form.VisibleCleanupCount -and 'CryptographicServices' -in $selected.RemoveItems -and 'DellSupportAssist' -notin $selected.RemoveItems -and 'ASUSSystemDiagnosis' -notin $selected.RemoveItems) 'Bulk cleanup skipped collapsed actions or selected hidden manufacturers.'
+        $before=$selected.RemoveItems -join ','
+        $form.SetCleanupSectionExpanded('Services',$true);$form.SetCleanupSectionExpanded('Apps',$true)
+        Assert ((($form.SelectedConfiguration() | ConvertFrom-Json).RemoveItems -join ',') -eq $before) 'Expansion changed the selection.'
+        $form.SelectAllCleanup($false)
+        Assert (($form.SelectedConfiguration() | ConvertFrom-Json).RemoveItems.Count -eq 0) 'Cleanup clear-all retained collapsed actions.'
+        $form.Controls.Find('deviceType',$true)[0].SelectedIndex=1
+        $form.Controls.Find('manufacturer',$true)[0].SelectedIndex=1
+        $form.SelectAllCleanup($true)
+        $selected=$form.SelectedConfiguration() | ConvertFrom-Json
+        Assert ('ASUSSystemDiagnosis' -in $selected.RemoveItems -and 'MyASUS' -in $selected.RemoveItems -and 'DellSupportAssist' -notin $selected.RemoveItems) 'ASUS bulk selection scope failed.'
+        $form.ImagePicker=[Func[bool,string]]{param($lock);return $null}
+        $form.SelectAllGear($true)
+        $selected=$form.SelectedConfiguration() | ConvertFrom-Json
+        Assert ($selected.InstallItems.Count -eq 4 -and $null -eq $selected.PSObject.Properties['WallpaperPath']) 'Gear select-all mishandled image-picker cancellation.'
+        $form.SelectAllGear($false)
+        Assert (($form.SelectedConfiguration() | ConvertFrom-Json).InstallItems.Count -eq 0) 'Gear clear-all retained apps.'
+    } finally {$form.Dispose()}
+}
+Test 'Desktop taskbar preview follows every app toggle without changing installation selections' {
+    $form=[TinnosDebloat.Ui]::Create()
+    try {
+        $gear=$form.Controls.Find('installList',$true)[0];$preview=$form.Controls.Find('desktopPreview',$true)[0]
+        Assert ($preview.Programs.Count -eq 3 -and 'Google Chrome' -in $preview.Programs) 'Initial taskbar apps missing.'
+        $gear.SetItemChecked(2,$false)
+        Assert ('Google Chrome' -notin $preview.Programs -and $preview.Programs.Count -eq 2) 'Unchecking app did not update taskbar immediately.'
+        $gear.SetItemChecked(3,$true)
+        Assert ('TranslucentTB' -in $preview.Programs -and $preview.Translucent) 'TranslucentTB preview not updated.'
+        $form.SelectAllGear($false)
+        Assert ($preview.Programs.Count -eq 0) 'Clearing gear retained taskbar icons.'
+        Assert ($form.Controls.Find('currentTask',$true)[0].Text -eq '' -and $form.Controls.Find('selectionHelp',$true).Count -eq 0) 'Idle status/header help clutter remains.'
+        $form.SetCleanupChecked('DesktopIcons',$false)
+        Assert ($preview.DesktopIcons) 'Desktop icon preview ignored cleanup selection.'
+    } finally {$form.Dispose()}
 }

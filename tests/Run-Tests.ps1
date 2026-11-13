@@ -799,15 +799,15 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
             Assert (!@($controls | Where-Object {$_ -is [Windows.Forms.CheckBox] -or $_ -is [Windows.Forms.RadioButton]}).Count) 'Old app-action or Office toggles remain.'
             Assert ('EQUIP GEAR' -in $controls.Text -and 'REMOVE WASPS' -in $controls.Text) 'Action headings missing.'
             $gear=$form.Controls.Find('installList',$true)[0]
-            Assert ($gear.Items.Count -eq 4 -and $gear.CheckedItems.Count -eq 3) 'Equipment choices missing.'
-            $choices=$form.Controls.Find('removalList',$true)[0]
-            Assert ($choices.Items.Count -eq @((Get-Content (Join-Path $root 'debloat-catalog.json') -Raw | ConvertFrom-Json) | Where-Object {$_.PSObject.Properties['Vendor'] -eq $null -or $_.Vendor -notin @('Dell','ASUS')}).Count) 'Removal choices differ from the engine catalog.'
-            Assert ($choices.CheckedItems.Count -lt $choices.Items.Count) 'High impact services must require selection.'
+            Assert ($gear.Items.Count -eq 6 -and $gear.CheckedItems.Count -eq 3) 'Equipment choices missing.'
+            $choices=$form.Controls.Find('cleanupApps',$true)[0]
+            Assert ($form.VisibleCleanupCount -eq @((Get-Content (Join-Path $root 'debloat-catalog.json') -Raw | ConvertFrom-Json) | Where-Object {$_.PSObject.Properties['Vendor'] -eq $null -or $_.Vendor -notin @('Dell','ASUS')}).Count) 'Removal choices differ from the engine catalog.'
+            Assert (@(($form.SelectedConfiguration() | ConvertFrom-Json).RemoveItems).Count -lt $form.VisibleCleanupCount) 'High impact services must require selection.'
             $choices.SetItemChecked(0,$false)
             Assert (!$choices.GetItemChecked(0)) 'Unchecked Teams cannot be kept.'
             foreach($item in $choices.Items) {Assert ($item.ToString() -match '^(Uninstall|Deactivate|Hide|Enable|Set|Fully disable) ') ('Ambiguous action label: '+$item)}
             Assert ($form.Controls.Find('brandEmblem',$true).Count -eq 1) 'Emblem missing.'
-            for($i=0;$i -lt $choices.Items.Count;$i++) {$choices.SetItemChecked($i,$false)}
+            $form.SelectAllCleanup($false)
             for($i=0;$i -lt $gear.Items.Count;$i++) {$gear.SetItemChecked($i,$false)}
             $gear.SetItemChecked(0,$true)
             $selected=$form.SelectedConfiguration() | ConvertFrom-Json
@@ -815,8 +815,11 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
             Assert ($null -eq $selected.PSObject.Properties['IncludeAccess'] -and $null -eq $selected.PSObject.Properties['AppMode']) 'Removed configuration options still generated.'
             Assert ($form.Controls.Find('detailTabs',$true)[0].TabPages.Count -eq 2) 'Results tab remains.'
             $actions=@($controls | Where-Object {$_ -is [Windows.Forms.Button]})
-            Assert ($actions.Count -eq 8 -and 'Start' -in $actions.Text -and 'Details' -in $actions.Text)  'Unexpected action buttons.'
-            foreach ($name in @('selectionHelp','gearHelp','waspsHelp')) {
+            Assert ('Apply changes' -in $actions.Text -and 'Activity' -in $actions.Text -and @($actions | Where-Object Text -eq 'Select all').Count -eq 2 -and @($actions | Where-Object Text -eq 'Clear all').Count -eq 2) 'Selection/apply controls missing.'
+            Assert ($form.Controls.Find('selectionHelp',$true).Count -eq 0 -and $form.Controls.Find('wallpaperButton',$true).Count -eq 0 -and $form.Controls.Find('imageSelection',$true).Count -eq 0) 'Removed interface clutter remains.'
+            Assert ($form.Controls.Find('brandTitle',$true)[0].Text -ceq 'TINNOS DEBLOAT') 'Header text changed.'
+            Assert ($form.Controls.Find('desktopPreview',$true).Count -eq 1) 'Desktop preview missing.'
+            foreach ($name in @('gearHelp','waspsHelp')) {
                 $help=$form.Controls.Find($name,$true)[0]
                 Assert ($help.Text -eq '?' -and $help.AccessibleDescription.Length -gt 30) 'Contextual help guidance missing.'
             }

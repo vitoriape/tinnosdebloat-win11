@@ -14,7 +14,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("TinnosDebloat-Win11")]
 [assembly: AssemblyDescription("Windows 11 provisioning and Teams removal")]
-[assembly: AssemblyVersion("2.7.0.0")]
+[assembly: AssemblyVersion("2.8.0.0")]
 
 namespace TinnosDebloat
 {
@@ -178,208 +178,434 @@ namespace TinnosDebloat
         public static Form Create() { return new MainForm(); }
     }
 
+    internal sealed class ChoiceList : CheckedListBox
+    {
+        private readonly ToolTip hint = new ToolTip();
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+        public int RowHeight { get { return Math.Max(36, Font.Height + 16); } }
+        public ChoiceList()
+        {
+            Dock = DockStyle.Fill; CheckOnClick = true; IntegralHeight = false;
+            BorderStyle = BorderStyle.None; BackColor = Color.FromArgb(25, 31, 36);
+            ForeColor = Color.FromArgb(225, 230, 233); Font = new Font("Segoe UI", 10.5f);
+            MouseMove += delegate(object sender, MouseEventArgs e) {
+                int index = IndexFromPoint(e.Location); string label = index < 0 ? "" : Items[index].ToString();
+                if (hint.GetToolTip(this) != label) hint.SetToolTip(this, label);
+            };
+        }
+        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); SendMessage(Handle, 0x1a0, IntPtr.Zero, new IntPtr(RowHeight)); }
+        protected override void OnDrawItem(DrawItemEventArgs e)
+        {
+            if (e.Index < 0 || e.Index >= Items.Count) return;
+            using (SolidBrush fill = new SolidBrush((e.State & DrawItemState.Selected) != 0 ? Color.FromArgb(34, 43, 49) : BackColor)) e.Graphics.FillRectangle(fill, e.Bounds);
+            Rectangle box = new Rectangle(e.Bounds.X + 7, e.Bounds.Y + (e.Bounds.Height - 17) / 2, 17, 17);
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (System.Drawing.Drawing2D.GraphicsPath shape = Visuals.Rounded(box, 4)) {
+                using (SolidBrush fill = new SolidBrush(GetItemChecked(e.Index) ? Color.FromArgb(244, 195, 64) : Color.FromArgb(34, 42, 48))) e.Graphics.FillPath(fill, shape);
+                using (Pen outline = new Pen(GetItemChecked(e.Index) ? Color.FromArgb(244, 195, 64) : Color.FromArgb(83, 96, 104))) e.Graphics.DrawPath(outline, shape);
+            }
+            if (GetItemChecked(e.Index)) using (Pen tick = new Pen(Color.FromArgb(20, 26, 30), 2))
+                e.Graphics.DrawLines(tick, new Point[] { new Point(box.X + 4, box.Y + 8), new Point(box.X + 7, box.Y + 11), new Point(box.X + 13, box.Y + 5) });
+            TextRenderer.DrawText(e.Graphics, Items[e.Index].ToString(), Font,
+                new Rectangle(e.Bounds.X + 36, e.Bounds.Y, Math.Max(1, e.Bounds.Width - 43), e.Bounds.Height), Enabled ? ForeColor : Color.Gray,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine);
+        }
+        protected override void Dispose(bool disposing) { if (disposing) hint.Dispose(); base.Dispose(disposing); }
+    }
+    internal static class Visuals
+    {
+        public static System.Drawing.Drawing2D.GraphicsPath Rounded(Rectangle bounds, int radius)
+        {
+            System.Drawing.Drawing2D.GraphicsPath path = new System.Drawing.Drawing2D.GraphicsPath();
+            int d = Math.Max(2, Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height)));
+            path.AddArc(bounds.X, bounds.Y, d, d, 180, 90); path.AddArc(bounds.Right - d, bounds.Y, d, d, 270, 90);
+            path.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90); path.AddArc(bounds.X, bounds.Bottom - d, d, d, 90, 90); path.CloseFigure(); return path;
+        }
+    }
+    internal sealed class SurfaceCard : Panel
+    {
+        public SurfaceCard() { SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true); BackColor = Color.FromArgb(16, 21, 25); Padding = new Padding(18); }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e); e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (System.Drawing.Drawing2D.GraphicsPath path = Visuals.Rounded(new Rectangle(0, 0, Width - 1, Height - 1), 15)) {
+                using (SolidBrush fill = new SolidBrush(Color.FromArgb(25, 31, 36))) e.Graphics.FillPath(fill, path);
+                using (Pen edge = new Pen(Color.FromArgb(43, 52, 59))) e.Graphics.DrawPath(edge, path);
+            }
+        }
+    }
+    internal sealed class CleanupSection : Panel
+    {
+        public readonly ChoiceList List = new ChoiceList();
+        public readonly Button Toggle;
+        private readonly string title;
+        public bool Expanded { get; private set; }
+        public CleanupSection(string name, string label, bool expanded)
+        {
+            Name = "group" + name; title = label; BackColor = Color.FromArgb(25, 31, 36); Margin = new Padding(0, 0, 0, 9);
+            Toggle = new Button { Name = "toggle" + name, TextAlign = ContentAlignment.MiddleLeft, FlatStyle = FlatStyle.Flat, Dock = DockStyle.Top,
+                Height = 42, BackColor = Color.FromArgb(34, 42, 48), ForeColor = Color.FromArgb(225, 230, 233), Font = new Font("Segoe UI Semibold", 10) };
+            Toggle.Cursor = Cursors.Hand; Toggle.FlatAppearance.BorderSize = 0; Toggle.FlatAppearance.MouseOverBackColor = Color.FromArgb(43, 53, 61);
+            List.Name = "cleanup" + name; List.Dock = DockStyle.Fill;
+            Controls.Add(List); Controls.Add(Toggle); Expanded = expanded;
+            Toggle.Click += delegate { SetExpanded(!Expanded); };
+        }
+        public void SetExpanded(bool expanded)
+        {
+            Expanded = expanded; List.Visible = expanded;
+            Toggle.Text = (expanded ? "\u2304  " : "\u203a  ") + title + "   " + List.Items.Count;
+            Toggle.AccessibleName = title + (expanded ? " expanded" : " collapsed");
+            Height = 42 + (expanded ? Math.Min(248, List.Items.Count * List.RowHeight + 4) : 0);
+        }
+    }
+
+    internal sealed class DesktopPreview : Control
+    {
+        private Image wallpaper;
+        private string imagePath = "";
+        private string[] programs = new string[0];
+        public string WallpaperPath { get { return imagePath; } }
+        public string[] Programs { get { return (string[])programs.Clone(); } }
+        public bool Moss, DesktopIcons, Translucent;
+        public DesktopPreview()
+        {
+            Name = "desktopPreview"; Dock = DockStyle.Fill; BackColor = Color.FromArgb(25, 31, 36);
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+        public void UpdateDesktop(string path, string[] selectedPrograms)
+        {
+            if (path != imagePath) {
+                Image next = null;
+                if (path != "" && File.Exists(path)) using (Image source = Image.FromFile(path)) next = new Bitmap(source);
+                if (wallpaper != null) wallpaper.Dispose(); wallpaper = next; imagePath = path;
+            }
+            programs = selectedPrograms;
+            AccessibleDescription = "Desktop preview. Wallpaper: " + (path == "" ? "Default preview" : Path.GetFileName(path)) + ". Taskbar apps: " + string.Join(", ", programs);
+            Invalidate();
+        }
+        private static void AppIcon(Graphics g, string app, Rectangle rect)
+        {
+            if (app == "Google Chrome") {
+                using (SolidBrush red = new SolidBrush(Color.FromArgb(235, 80, 65))) g.FillPie(red, rect, 210, 120);
+                using (SolidBrush yellow = new SolidBrush(Color.FromArgb(247, 199, 65))) g.FillPie(yellow, rect, 330, 120);
+                using (SolidBrush green = new SolidBrush(Color.FromArgb(68, 174, 111))) g.FillPie(green, rect, 90, 120);
+                Rectangle center = Rectangle.Inflate(rect, -rect.Width / 3, -rect.Height / 3);
+                using (SolidBrush blue = new SolidBrush(Color.FromArgb(70, 145, 227))) g.FillEllipse(blue, center);
+            } else if (app == "Google Drive") {
+                Point top = new Point(rect.X + rect.Width / 2, rect.Y), left = new Point(rect.X, rect.Bottom), right = new Point(rect.Right, rect.Bottom);
+                using (Pen pen = new Pen(Color.FromArgb(77, 179, 117), Math.Max(3, rect.Width / 4))) g.DrawLine(pen, top, left);
+                using (Pen pen = new Pen(Color.FromArgb(246, 199, 72), Math.Max(3, rect.Width / 4))) g.DrawLine(pen, top, right);
+                using (Pen pen = new Pen(Color.FromArgb(72, 142, 233), Math.Max(3, rect.Width / 4))) g.DrawLine(pen, left, right);
+            } else {
+                Color color = app == "Microsoft 365" ? Color.FromArgb(236, 108, 63) : Color.FromArgb(112, 180, 204);
+                using (SolidBrush fill = new SolidBrush(color)) using (System.Drawing.Drawing2D.GraphicsPath shape = Visuals.Rounded(rect, 5)) g.FillPath(fill, shape);
+                using (Font font = new Font("Segoe UI", Math.Max(7, rect.Height * .48f), FontStyle.Bold))
+                    TextRenderer.DrawText(g, app == "Microsoft 365" ? "O" : "T", font, rect, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e); Graphics g = e.Graphics; g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            int width = Math.Max(20, ClientSize.Width - 4), height = Math.Max(90, Math.Min((int)(width * .64), ClientSize.Height - 100 - programs.Length * 42));
+            Rectangle screen = new Rectangle(2, 14, width - 4, height);
+            using (System.Drawing.Drawing2D.GraphicsPath shape = Visuals.Rounded(screen, 11)) {
+                System.Drawing.Drawing2D.GraphicsState state = g.Save(); g.SetClip(shape);
+                if (wallpaper != null) {
+                    float scale = Math.Max((float)screen.Width / wallpaper.Width, (float)screen.Height / wallpaper.Height);
+                    float w = wallpaper.Width * scale, h = wallpaper.Height * scale;
+                    g.DrawImage(wallpaper, screen.X + (screen.Width - w) / 2, screen.Y + (screen.Height - h) / 2, w, h);
+                } else {
+                    using (System.Drawing.Drawing2D.LinearGradientBrush sky = new System.Drawing.Drawing2D.LinearGradientBrush(screen,
+                        Moss ? Color.FromArgb(72, 104, 96) : Color.FromArgb(28, 61, 77), Color.FromArgb(13, 30, 37), 65f)) g.FillRectangle(sky, screen);
+                    using (SolidBrush hill = new SolidBrush(Color.FromArgb(55, 111, 108))) g.FillEllipse(hill, screen.X - width / 2, screen.Y + height / 3, width + width / 2, height * 2);
+                    using (SolidBrush hill = new SolidBrush(Color.FromArgb(30, 73, 77))) g.FillEllipse(hill, screen.X + width / 3, screen.Y + height / 2, width, height);
+                }
+                if (DesktopIcons) using (SolidBrush white = new SolidBrush(Color.FromArgb(205, 222, 230))) {
+                    g.FillRectangle(white, screen.X + 13, screen.Y + 15, 13, 17); g.FillRectangle(white, screen.X + 13, screen.Y + 51, 13, 17);
+                }
+                Rectangle taskbar = new Rectangle(screen.X, screen.Bottom - 36, screen.Width, 36);
+                using (SolidBrush fill = new SolidBrush(Color.FromArgb(Translucent ? 100 : 238, 19, 27, 34))) g.FillRectangle(fill, taskbar);
+                int count = 1 + programs.Length, gap = 30, x = screen.X + (screen.Width - count * gap) / 2;
+                using (SolidBrush win = new SolidBrush(Color.FromArgb(98, 184, 235))) {
+                    g.FillRectangle(win, x, taskbar.Y + 10, 7, 7); g.FillRectangle(win, x + 9, taskbar.Y + 10, 7, 7);
+                    g.FillRectangle(win, x, taskbar.Y + 19, 7, 7); g.FillRectangle(win, x + 9, taskbar.Y + 19, 7, 7);
+                }
+                for (int i = 0; i < programs.Length; i++) AppIcon(g, programs[i], new Rectangle(x + (i + 1) * gap, taskbar.Y + 10, 17, 17));
+                g.Restore(state);
+                using (Pen edge = new Pen(Color.FromArgb(67, 82, 91))) g.DrawPath(edge, shape);
+            }
+            int y = screen.Bottom + 28;
+            using (Font title = new Font("Segoe UI Semibold", 9)) TextRenderer.DrawText(g, "ON YOUR TASKBAR", title, new Point(2, y), Color.FromArgb(139, 155, 166));
+            y += 32;
+            if (programs.Length == 0) using (Font font = new Font("Segoe UI", 10)) TextRenderer.DrawText(g, "Choose your gear to build the preview.", font, new Rectangle(2, y, width, 50), Color.Silver, TextFormatFlags.WordBreak);
+            foreach (string program in programs) {
+                AppIcon(g, program, new Rectangle(5, y + 2, 23, 23));
+                using (Font font = new Font("Segoe UI", 10)) TextRenderer.DrawText(g, program, font, new Rectangle(42, y, width - 44, 30), Color.FromArgb(220, 228, 232), TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+                y += 42;
+            }
+        }
+        protected override void Dispose(bool disposing) { if (disposing && wallpaper != null) wallpaper.Dispose(); base.Dispose(disposing); }
+    }
+
     internal sealed class MainForm : Form
     {
-        private static readonly Color Background = Color.FromArgb(17, 23, 27);
-        private static readonly Color Surface = Color.FromArgb(29, 39, 43);
-        private static readonly Color Accent = Color.FromArgb(245, 195, 58);
-        private readonly CheckedListBox equipment = new CheckedListBox { Name = "installList", Dock = DockStyle.Fill,
-            CheckOnClick = true, HorizontalScrollbar = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
-        private readonly Button start = ActionButton("Start");
-        private readonly Button details = ActionButton("Details");
+        private static readonly Color Background = Color.FromArgb(16, 21, 25);
+        private static readonly Color Surface = Color.FromArgb(25, 31, 36);
+        private static readonly Color Accent = Color.FromArgb(244, 195, 64);
+        private readonly ChoiceList equipment = new ChoiceList { Name = "installList" };
+        private readonly Button start = ActionButton("Apply changes");
+        private readonly Button details = ActionButton("Activity");
         private readonly TextBox log = new TextBox { Name = "liveLog", Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Both,
             WordWrap = false, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
         private readonly TextBox errors = new TextBox { Name = "errorDetails", Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical,
             WordWrap = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
-        private readonly CheckedListBox cleanup = new CheckedListBox { Name = "removalList", Dock = DockStyle.Fill, Height = 190,
-            CheckOnClick = true, HorizontalScrollbar = true, BackColor = Surface, ForeColor = Color.Gainsboro, BorderStyle = BorderStyle.None };
-        private readonly ComboBox deviceType = new ComboBox { Name = "deviceType", DropDownStyle = ComboBoxStyle.DropDownList, Width = 125 };
-        private readonly ComboBox manufacturer = new ComboBox { Name = "manufacturer", DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
+        private readonly ComboBox deviceType = new ComboBox { Name = "deviceType", DropDownStyle = ComboBoxStyle.DropDownList, Width = 112, FlatStyle = FlatStyle.Flat, BackColor = Surface, ForeColor = Color.White };
+        private readonly ComboBox manufacturer = new ComboBox { Name = "manufacturer", DropDownStyle = ComboBoxStyle.DropDownList, Width = 130, FlatStyle = FlatStyle.Flat, BackColor = Surface, ForeColor = Color.White };
+        private readonly FlowLayoutPanel cleanupHost = new FlowLayoutPanel { Name = "cleanupSections", Dock = DockStyle.Fill, AutoScroll = true, WrapContents = false,
+            FlowDirection = FlowDirection.TopDown, Margin = Padding.Empty, BackColor = Surface };
+        private readonly List<CleanupSection> sections = new List<CleanupSection>();
         private readonly Dictionary<string, bool> cleanupSelection = new Dictionary<string, bool>();
         private readonly List<CleanupItem> cleanupItems = new List<CleanupItem>();
+        private readonly List<Button> selectionButtons = new List<Button>();
         private readonly HashSet<string> displayedIssues = new HashSet<string>();
         private readonly TabControl detailTabs = new TabControl { Name = "detailTabs", Dock = DockStyle.Fill, Visible = false };
-        private readonly Label status = new Label { Name = "currentTask", Text = "Ready - select actions, then Start.", Dock = DockStyle.Fill, Height = 42, ForeColor = Color.Gainsboro, Margin = new Padding(0, 10, 0, 8) };
-        private readonly ProgressBar progress = new ProgressBar { Dock = DockStyle.Fill, Height = 4 };
-        private readonly Button wallpaperButton = ActionButton("Wallpaper...");
-        private readonly Button lockScreenButton = ActionButton("Lock screen...");
-        private readonly Button clearImagesButton = ActionButton("Clear images");
-        private readonly Label imageSelection = new Label { Name = "imageSelection", AutoSize = false, Height = 52, Dock = DockStyle.Fill, AutoEllipsis = true, ForeColor = Color.Silver };
+        private readonly Label status = new Label { Name = "currentTask", Text = "", Dock = DockStyle.Top, Height = 35, ForeColor = Color.Silver };
+        private readonly ProgressBar progress = new ProgressBar { Dock = DockStyle.Bottom, Height = 3, Visible = false };
+        private readonly DesktopPreview desktopPreview = new DesktopPreview();
+        private readonly TableLayoutPanel layout = new TableLayoutPanel();
         private string wallpaperPath = "", lockScreenPath = "";
+        private bool syncingImages, refreshingCleanup;
+        public Func<bool, string> ImagePicker { get; set; }
+        public Func<bool> ConfirmLockScreen { get; set; }
         private Process running;
         private string directory, output;
         private bool receivedResult;
         private string primaryCode = "";
         private sealed class CleanupItem {
-            public string Id, Label, Vendor; public bool DefaultSelected;
+            public string Id, Label, Vendor, Group; public bool DefaultSelected;
             public override string ToString() { return Label; }
         }
 
         public MainForm()
         {
             Text = "TinnosDebloat-Win11"; BackColor = Background; ForeColor = Color.White;
-            Font = new Font("Segoe UI", 10); ClientSize = new Size(1100, 700); MinimumSize = new Size(1000, 680);
+            Font = new Font("Segoe UI", 10); ClientSize = new Size(Math.Min(1420, Screen.PrimaryScreen.WorkingArea.Width - 48), Math.Min(790, Screen.PrimaryScreen.WorkingArea.Height - 70)); MinimumSize = new Size(1200, 700);
             using (Stream icon = Assembly.GetExecutingAssembly().GetManifestResourceStream("Brand.app.ico")) Icon = new Icon(icon);
             StartPosition = FormStartPosition.CenterScreen;
-            TableLayoutPanel layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(22), ColumnCount = 1, RowCount = 6 };
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 420));
-            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 5));
-            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            layout.Dock = DockStyle.Fill; layout.Padding = new Padding(28, 20, 28, 20); layout.ColumnCount = 1; layout.RowCount = 4;
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92)); layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 66)); layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 0));
             TableLayoutPanel header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
-            header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 88)); header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            PictureBox emblem = new PictureBox { Name = "brandEmblem", SizeMode = PictureBoxSizeMode.Zoom, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 16, 12) };
-            using (Stream image = Assembly.GetExecutingAssembly().GetManifestResourceStream("Brand.emblem.png")) emblem.Image = new Bitmap(image);
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 68)); header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            PictureBox emblem = new PictureBox { Name = "brandEmblem", SizeMode = PictureBoxSizeMode.Zoom, Dock = DockStyle.Fill, Margin = new Padding(0, 6, 16, 18) };
+            using (Stream image = Assembly.GetExecutingAssembly().GetManifestResourceStream("Brand.emblem.png"))
+            using (Bitmap source = new Bitmap(image)) emblem.Image = source.Clone(new Rectangle(source.Width / 5, source.Height / 8, source.Width * 3 / 5, source.Height * 3 / 4), System.Drawing.Imaging.PixelFormat.Format32bppArgb);
             header.Controls.Add(emblem);
-            FlowLayoutPanel heading = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false };
-            heading.Controls.Add(new Label { Text = "TINNOS / DEBLOAT", AutoSize = true, Font = new Font("Segoe UI Semibold", 22), ForeColor = Accent });
-            heading.Controls.Add(CreateHelpButton("selectionHelp", "How selections work", "Checked = execute the action. Unchecked = leave unchanged. Review your selections, then click Start. Details shows the live log and any errors."));
-            header.Controls.Add(heading); layout.Controls.Add(header);
-            equipment.Items.Add(new CleanupItem { Id = "GoogleDrive", Label = "Install Google Drive" }, true);
-            equipment.Items.Add(new CleanupItem { Id = "Office", Label = "Install Microsoft 365 Office" }, true);
-            equipment.Items.Add(new CleanupItem { Id = "Chrome", Label = "Install Google Chrome" }, true);
-            equipment.Items.Add(new CleanupItem { Id = "TranslucentTB", Label = "Install TranslucentTB" }, false);
-            TableLayoutPanel gearPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Margin = Padding.Empty };
-            gearPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            gearPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
-            gearPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-            gearPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
-            wallpaperButton.Name = "wallpaperButton"; lockScreenButton.Name = "lockScreenButton"; clearImagesButton.Name = "clearImagesButton";
-            wallpaperButton.Width = 145; lockScreenButton.Width = 145; clearImagesButton.Width = 145;
-            wallpaperButton.Margin = new Padding(0, 0, 8, 0);
-            wallpaperButton.Click += delegate { PickImage(false); };
-            lockScreenButton.Click += delegate { PickImage(true); };
-            clearImagesButton.Click += delegate { SetImageSelections("", ""); };
-            gearPanel.Controls.Add(equipment);
-            gearPanel.Controls.Add(Row(wallpaperButton, lockScreenButton));
-            gearPanel.Controls.Add(clearImagesButton); gearPanel.Controls.Add(imageSelection);
-            SetImageSelections("", "");
-            TableLayoutPanel choices = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
-            choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36)); choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 64));
-            choices.Controls.Add(ActionSection("EQUIP GEAR", gearPanel, "Office: PT-BR, 64-bit. Word, Excel, PowerPoint. Teams, OneNote, OneDrive, Access and Outlook excluded.\n\nTranslucentTB installs from Microsoft Store for the account running this app. Store/App Installer must be available.\n\nWallpaper and Lock screen open the Windows file picker. Choose a JPG, PNG or BMP; selections apply to the account running this app only after Start. A custom wallpaper overrides the Moss background selection. Clear images cancels pending image changes."));
-            deviceType.Items.AddRange(new object[] { "Desktop", "Laptop" });
-            manufacturer.Items.AddRange(new object[] { "Other / None", "ASUS", "Dell" });
+            header.Controls.Add(new Label { Name = "brandTitle", Text = "TINNOS DEBLOAT", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft,
+                Font = new Font("Segoe UI Semibold", 25), ForeColor = Accent, Margin = new Padding(0, 0, 0, 12) });
+            layout.Controls.Add(header, 0, 0);
+            equipment.Items.Add(new CleanupItem { Id = "GoogleDrive", Label = "Google Drive" }, true);
+            equipment.Items.Add(new CleanupItem { Id = "Office", Label = "Microsoft 365 Office" }, true);
+            equipment.Items.Add(new CleanupItem { Id = "Chrome", Label = "Google Chrome" }, true);
+            equipment.Items.Add(new CleanupItem { Id = "TranslucentTB", Label = "TranslucentTB" }, false);
+            equipment.Items.Add(new CleanupItem { Id = "Wallpaper", Label = "Wallpaper" }, false);
+            equipment.Items.Add(new CleanupItem { Id = "LockScreen", Label = "Lock screen" }, false);
+            ImagePicker = BrowseImage;
+            ConfirmLockScreen = delegate { return MessageBox.Show(this, "Use this image on the lock screen as well?", "Lock screen", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes; };
+            equipment.ItemCheck += EquipmentChanged;
+            TableLayoutPanel gear = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Margin = Padding.Empty, BackColor = Surface };
+            gear.RowStyles.Add(new RowStyle(SizeType.Absolute, 42)); gear.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            gear.Controls.Add(SelectionRow("gear", delegate { SelectAllGear(true); }, delegate { SelectAllGear(false); })); gear.Controls.Add(equipment);
+            deviceType.Items.AddRange(new object[] { "Desktop", "Laptop" }); manufacturer.Items.AddRange(new object[] { "Other / None", "ASUS", "Dell" });
             deviceType.SelectedIndex = 0; manufacturer.SelectedIndex = 0; manufacturer.Enabled = false;
-            TableLayoutPanel wasps = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Margin = Padding.Empty };
-            wasps.RowStyles.Add(new RowStyle(SizeType.Absolute, 48)); wasps.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            wasps.Controls.Add(Row(new Label { Text = "Device", AutoSize = true, Padding = new Padding(0, 5, 5, 0) }, deviceType,
-                new Label { Text = "Brand", AutoSize = true, Padding = new Padding(10, 5, 5, 0) }, manufacturer));
-            wasps.Controls.Add(cleanup);
-            choices.Controls.Add(ActionSection("REMOVE WASPS", wasps, "Uninstall removes an app. Deactivate stops and disables a service. Windows may require sign-out or restart.\n\nDesktop excludes ASUS and Dell utilities. For a laptop, choose its brand to select matching utilities. Review these before Start: some affect battery settings or recovery. Armoury Crate requires ASUS's official uninstall tool.\n\nFull Search UI blocking requires updated Windows 11 Pro or higher and a restart. Indexing is a separate action.\n\nOptional ASUS and AMD services are unchecked by default: disabling them can affect hotkeys, battery settings, display profiles or GPU crash recovery. Cryptographic Services (CryptSvc) is not BitLocker; disabling it can break Windows Update and signature verification. Services with active dependencies are not force-stopped.\n\nEmpty Start menu clears pinned apps and hides Recommended and All apps on supported updated Windows 11 Pro+ builds. Sign out or restart afterward. The empty-state wording depends on your Windows version. No installed apps or shortcuts are deleted."));
-            layout.Controls.Add(choices);
+            TableLayoutPanel wasps = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1, Margin = Padding.Empty, BackColor = Surface };
+            wasps.RowStyles.Add(new RowStyle(SizeType.Absolute, 45)); wasps.RowStyles.Add(new RowStyle(SizeType.Absolute, 43)); wasps.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            wasps.Controls.Add(Row(new Label { Text = "Device", AutoSize = true, Padding = new Padding(0, 5, 6, 0), ForeColor = Color.Silver }, deviceType,
+                new Label { Text = "Brand", AutoSize = true, Padding = new Padding(12, 5, 6, 0), ForeColor = Color.Silver }, manufacturer));
+            wasps.Controls.Add(SelectionRow("cleanup", delegate { SelectAllCleanup(true); }, delegate { SelectAllCleanup(false); })); wasps.Controls.Add(cleanupHost);
+            foreach (string name in new string[] { "Apps", "Services", "Appearance", "Manufacturer" }) {
+                CleanupSection section = new CleanupSection(name, name == "Appearance" ? "Windows & appearance" : name == "Manufacturer" ? "Manufacturer apps" : name, name == "Apps");
+                sections.Add(section); cleanupHost.Controls.Add(section);
+                section.List.ItemCheck += delegate(object sender, ItemCheckEventArgs e) {
+                    if (!refreshingCleanup) {
+                        ChoiceList list = (ChoiceList)sender; CleanupItem item = (CleanupItem)list.Items[e.Index];
+                        cleanupSelection[item.Id] = e.NewValue == CheckState.Checked; RefreshPreview();
+                    }
+                };
+            }
+            cleanupHost.SizeChanged += delegate { SizeSections(); };
+            TableLayoutPanel choices = new TableLayoutPanel { Name = "workspaceColumns", Dock = DockStyle.Fill, ColumnCount = 3, Margin = Padding.Empty };
+            choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 24)); choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 43)); choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
+            choices.Controls.Add(ActionSection("EQUIP GEAR", gear,
+                "Choose programs to install. Wallpaper and Lock screen open the image picker when checked. Wallpaper also asks whether to use the same image on the lock screen. Uncheck to cancel that image; rechecking opens the picker again. Select all includes the image choices and their dialogs.\n\nOffice: PT-BR, 64-bit; Word, Excel and PowerPoint. TranslucentTB uses Microsoft Store. Image changes apply to the account running this app after Apply changes."));
+            choices.Controls.Add(ActionSection("REMOVE WASPS", wasps,
+                "Checked actions run after Apply changes. Select all includes optional and high-impact actions in all sections for the current device/brand, even when collapsed. Clear all leaves them unchanged.\n\nASUS and Dell actions are shown only for the chosen laptop brand. Disabling optional services may affect battery settings, hotkeys, GPU recovery or Windows Update. Cryptographic Services is not disk encryption. Armoury Crate requires ASUS's uninstall tool.\n\nSearch and Start policies require supported updated Windows editions and a restart. Expand each section to review the action labels."));
+            choices.Controls.Add(ActionSection("DESKTOP PREVIEW", desktopPreview, null)); layout.Controls.Add(choices, 0, 1);
             using (Stream data = Assembly.GetExecutingAssembly().GetManifestResourceStream("Payload.debloat-catalog.json"))
             using (StreamReader reader = new StreamReader(data)) {
                 foreach (object entry in (object[])ResultChannel.Serializer().DeserializeObject(reader.ReadToEnd())) {
-                    Dictionary<string, object> item = (Dictionary<string, object>)entry;
-                    CleanupItem choice = new CleanupItem { Id = TextValue(item, "Id"), Label = TextValue(item, "Name"), Vendor = TextValue(item, "Vendor"), DefaultSelected = !(Value(item, "DefaultSelected") is bool) || (bool)Value(item, "DefaultSelected") };
-                    cleanupItems.Add(choice); cleanupSelection[choice.Id] = ((choice.Vendor == "Dell" || choice.Vendor == "ASUS") && (!(Value(item, "SelectWithVendor") is bool) || (bool)Value(item, "SelectWithVendor"))) || choice.DefaultSelected;
+                    Dictionary<string, object> item = (Dictionary<string, object>)entry; string vendor = TextValue(item, "Vendor");
+                    bool service = Items(item, "Services").Length > 0;
+                    CleanupItem choice = new CleanupItem { Id = TextValue(item, "Id"), Label = TextValue(item, "Name"), Vendor = vendor,
+                        Group = service ? "Services" : vendor == "Dell" || vendor == "ASUS" ? "Manufacturer" : Value(item, "Setting") != null ? "Appearance" : "Apps",
+                        DefaultSelected = !(Value(item, "DefaultSelected") is bool) || (bool)Value(item, "DefaultSelected") };
+                    cleanupItems.Add(choice); cleanupSelection[choice.Id] = ((vendor == "Dell" || vendor == "ASUS") && (!(Value(item, "SelectWithVendor") is bool) || (bool)Value(item, "SelectWithVendor"))) || choice.DefaultSelected;
                 }
             }
-            RefreshCleanup();
-            deviceType.SelectedIndexChanged += delegate { manufacturer.Enabled = deviceType.SelectedIndex == 1; RefreshCleanup(); };
+            RefreshCleanup(); deviceType.SelectedIndexChanged += delegate { manufacturer.Enabled = deviceType.SelectedIndex == 1; RefreshCleanup(); };
             manufacturer.SelectedIndexChanged += delegate { RefreshCleanup(); };
-            start.Width = 300; details.Width = 140; details.Name = "detailsButton"; start.Name = "startButton";
-            layout.Controls.Add(ActionRow(details, start));
-            layout.Controls.Add(status); layout.Controls.Add(progress);
-            foreach (string name in new string[] { "Log", "Errors" })
-                detailTabs.TabPages.Add(new TabPage(name) { BackColor = Surface, Padding = new Padding(8) });
-            detailTabs.TabPages[0].Controls.Add(log); detailTabs.TabPages[1].Controls.Add(errors);
-            layout.Controls.Add(detailTabs); Controls.Add(layout);
-            start.BackColor = Accent; start.ForeColor = Background;
-            details.FlatAppearance.BorderColor = Color.FromArgb(75, 88, 100);
-            start.Click += delegate { Run(); };
-            details.Click += delegate { SetDetails(!detailTabs.Visible); };
-            FormClosing += delegate(object sender, FormClosingEventArgs e) {
-                if (running != null) { e.Cancel = true; status.Text = "An operation is running. Wait for the result."; }
-            };
+            start.Width = 218; details.Width = 120; details.Name = "detailsButton"; start.Name = "startButton";
+            start.BackColor = Accent; start.ForeColor = Background; start.FlatAppearance.BorderSize = 0; start.FlatAppearance.MouseOverBackColor = Color.FromArgb(255, 212, 99); start.FlatAppearance.MouseDownBackColor = Color.FromArgb(223, 170, 38);
+            layout.Controls.Add(ActionRow(details, start), 0, 2);
+            foreach (string name in new string[] { "Log", "Errors" }) detailTabs.TabPages.Add(new TabPage(name) { BackColor = Surface, Padding = new Padding(12) });
+            Panel live = new Panel { Dock = DockStyle.Fill, BackColor = Surface }; live.Controls.Add(log); live.Controls.Add(status);
+            detailTabs.TabPages[0].Controls.Add(live); detailTabs.TabPages[1].Controls.Add(errors);
+            layout.Controls.Add(detailTabs, 0, 3); Controls.Add(layout); Controls.Add(progress);
+            start.Click += delegate { Run(); }; details.Click += delegate { SetDetails(!detailTabs.Visible); };
+            FormClosing += delegate(object sender, FormClosingEventArgs e) { if (running != null) { e.Cancel = true; status.Text = "An operation is running. Wait for the result."; SetDetails(true); } };
+            RefreshPreview();
         }
-        private void PickImage(bool lockScreen)
+        private string BrowseImage(bool lockScreen)
         {
             using (OpenFileDialog picker = new OpenFileDialog { Title = lockScreen ? "Choose lock-screen image" : "Choose wallpaper",
-                Filter = "Images (*.jpg;*.jpeg;*.png;*.bmp)|*.jpg;*.jpeg;*.png;*.bmp", CheckFileExists = true, Multiselect = false }) {
-                if (picker.ShowDialog(this) != DialogResult.OK) return;
-                try {
-                    using (Image selected = Image.FromFile(picker.FileName)) {
-                        if (selected.Width < 1 || selected.Height < 1) throw new InvalidDataException("Invalid image.");
+                Filter = "Images (*.jpg;*.jpeg;*.png;*.bmp)|*.jpg;*.jpeg;*.png;*.bmp", CheckFileExists = true, Multiselect = false })
+                return picker.ShowDialog(this) == DialogResult.OK ? picker.FileName : null;
+        }
+        private void EquipmentChanged(object sender, ItemCheckEventArgs e)
+        {
+            if (syncingImages) return;
+            CleanupItem item = (CleanupItem)equipment.Items[e.Index];
+            if (item.Id == "Wallpaper" || item.Id == "LockScreen") {
+                if (e.NewValue == CheckState.Checked) {
+                    string path = ImagePicker(item.Id == "LockScreen");
+                    if (string.IsNullOrEmpty(path)) { e.NewValue = CheckState.Unchecked; return; }
+                    try {
+                        using (Image image = Image.FromFile(path)) if (image.Width < 1 || image.Height < 1 || (long)image.Width * image.Height > 100000000)
+                            throw new InvalidDataException("Choose an image up to 100 megapixels.");
+                        if (item.Id == "Wallpaper") {
+                            wallpaperPath = path;
+                            if (ConfirmLockScreen()) { lockScreenPath = path; SetImageCheck(5, true); }
+                        } else lockScreenPath = path;
+                    } catch (Exception error) {
+                        e.NewValue = CheckState.Unchecked;
+                        MessageBox.Show(this, error.Message, "Cannot open image", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     }
-                    SetImageSelections(lockScreen ? wallpaperPath : picker.FileName, lockScreen ? picker.FileName : lockScreenPath);
-                } catch (Exception error) { MessageBox.Show(this, error.Message, "Cannot open image", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+                } else if (item.Id == "Wallpaper") {
+                    if (lockScreenPath == wallpaperPath) { lockScreenPath = ""; SetImageCheck(5, false); }
+                    wallpaperPath = "";
+                } else lockScreenPath = "";
             }
+            RefreshPreview(e.Index, e.NewValue);
+        }
+        private void SetImageCheck(int index, bool check)
+        {
+            syncingImages = true;
+            try { equipment.SetItemChecked(index, check); } finally { syncingImages = false; }
         }
         public void SetImageSelections(string wallpaper, string lockScreen)
         {
             wallpaperPath = wallpaper ?? ""; lockScreenPath = lockScreen ?? "";
-            imageSelection.Text = "Wallpaper: " + (wallpaperPath == "" ? "Unchanged" : Path.GetFileName(wallpaperPath))
-                + Environment.NewLine + "Lock screen: " + (lockScreenPath == "" ? "Unchanged" : Path.GetFileName(lockScreenPath));
-            imageSelection.AccessibleDescription = "Wallpaper: " + wallpaperPath + "; Lock screen: " + lockScreenPath;
+            SetImageCheck(4, wallpaperPath != ""); SetImageCheck(5, lockScreenPath != ""); RefreshPreview();
+        }
+        public void SelectAllGear(bool selected)
+        {
+            for (int i = 0; i < equipment.Items.Count; i++) if (equipment.GetItemChecked(i) != selected) equipment.SetItemChecked(i, selected);
+            RefreshPreview();
+        }
+        public void SelectAllCleanup(bool selected)
+        {
+            foreach (CleanupSection section in sections) for (int i = 0; i < section.List.Items.Count; i++) section.List.SetItemChecked(i, selected);
+            RefreshPreview();
+        }
+        public void SetCleanupChecked(string id, bool selected)
+        {
+            foreach (CleanupSection section in sections) for (int i = 0; i < section.List.Items.Count; i++)
+                if (((CleanupItem)section.List.Items[i]).Id == id) { section.List.SetItemChecked(i, selected); return; }
+            throw new ArgumentException("Cleanup action is not available for the selected device: " + id);
+        }
+        public int VisibleCleanupCount { get { int count = 0; foreach (CleanupSection section in sections) count += section.List.Items.Count; return count; } }
+        public void SetCleanupSectionExpanded(string name, bool expanded)
+        {
+            foreach (CleanupSection section in sections) if (section.Name == "group" + name) { section.SetExpanded(expanded); return; }
+            throw new ArgumentException("Unknown cleanup section.");
+        }
+        private bool IsAvailable(CleanupItem item)
+        {
+            return item.Vendor != "Dell" && item.Vendor != "ASUS" || deviceType.SelectedIndex == 1 && item.Vendor == Convert.ToString(manufacturer.SelectedItem);
         }
         private void RefreshCleanup()
         {
-            for (int i = 0; i < cleanup.Items.Count; i++) {
-                CleanupItem item = (CleanupItem)cleanup.Items[i]; cleanupSelection[item.Id] = cleanup.GetItemChecked(i);
+            refreshingCleanup = true;
+            try {
+                foreach (CleanupSection section in sections) {
+                    section.List.BeginUpdate(); section.List.Items.Clear();
+                    foreach (CleanupItem item in cleanupItems) if (IsAvailable(item) && section.Name == "group" + item.Group) section.List.Items.Add(item, cleanupSelection[item.Id]);
+                    section.List.EndUpdate(); section.Visible = section.List.Items.Count > 0; section.SetExpanded(section.Expanded);
+                }
+            } finally { refreshingCleanup = false; }
+            SizeSections(); RefreshPreview();
+        }
+        private void SizeSections() { foreach (CleanupSection section in sections) section.Width = Math.Max(60, cleanupHost.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 2); }
+        private void RefreshPreview() { RefreshPreview(-1, CheckState.Unchecked); }
+        private void RefreshPreview(int pendingIndex, CheckState pendingState)
+        {
+            List<string> apps = new List<string>(); bool translucent = false;
+            for (int i = 0; i < 4; i++) if (i == pendingIndex ? pendingState == CheckState.Checked : equipment.GetItemChecked(i)) {
+                CleanupItem item = (CleanupItem)equipment.Items[i]; apps.Add(item.Id == "Office" ? "Microsoft 365" : item.Label);
+                if (item.Id == "TranslucentTB") translucent = true;
             }
-            cleanup.BeginUpdate(); cleanup.Items.Clear();
-            string vendor = deviceType.SelectedIndex == 1 ? Convert.ToString(manufacturer.SelectedItem) : "";
-            foreach (CleanupItem item in cleanupItems) {
-                bool oem = item.Vendor == "Dell" || item.Vendor == "ASUS";
-                if (oem && item.Vendor != vendor) continue;
-                cleanup.Items.Add(item, cleanupSelection[item.Id]);
-            }
-            cleanup.EndUpdate();
+            desktopPreview.Translucent = translucent;
+            bool hideIcons; desktopPreview.DesktopIcons = !cleanupSelection.TryGetValue("DesktopIcons", out hideIcons) || !hideIcons;
+            bool moss; desktopPreview.Moss = cleanupSelection.TryGetValue("BackgroundMoss", out moss) && moss;
+            desktopPreview.UpdateDesktop(wallpaperPath, apps.ToArray());
         }
         private void SetDetails(bool show)
         {
-            detailTabs.Visible = show;
-            int availableHeight = Screen.FromControl(this).WorkingArea.Height - SystemInformation.CaptionHeight - 32;
-            ClientSize = new Size(ClientSize.Width, Math.Min(availableHeight, show ? 940 : 700));
+            detailTabs.Visible = show; layout.RowStyles[3].Height = show ? 205 : 0;
+            int availableHeight = Screen.FromControl(this).WorkingArea.Height - SystemInformation.CaptionHeight - 26;
+            ClientSize = new Size(ClientSize.Width, Math.Min(availableHeight, show ? 990 : 790));
+            details.Text = show ? "Hide activity" : "Activity";
         }
         private static Button ActionButton(string text)
         {
-            Button button = new Button { Text = text, FlatStyle = FlatStyle.Flat, Width = 124, Height = 38,
-                BackColor = Surface, ForeColor = Color.Gainsboro, Margin = Padding.Empty };
-            button.FlatAppearance.BorderColor = Accent; return button;
+            Button button = new Button { Text = text, FlatStyle = FlatStyle.Flat, Width = 124, Height = 40,
+                Font = new Font("Segoe UI Semibold", 10), BackColor = Surface, ForeColor = Color.Gainsboro, Margin = Padding.Empty, Cursor = Cursors.Hand };
+            button.FlatAppearance.BorderColor = Color.FromArgb(59, 72, 81); button.FlatAppearance.MouseOverBackColor = Color.FromArgb(45, 57, 65); return button;
+        }
+        private Control SelectionRow(string name, Action select, Action clear)
+        {
+            Button all = ActionButton("Select all"), none = ActionButton("Clear all"); all.Name = name + "SelectAll"; none.Name = name + "ClearAll";
+            foreach (Button button in new Button[] { all, none }) { button.Width = 94; button.Height = 30; button.Font = new Font("Segoe UI", 9); button.FlatAppearance.BorderSize = 0; button.ForeColor = Color.FromArgb(169, 186, 198); selectionButtons.Add(button); }
+            all.Click += delegate { select(); }; none.Click += delegate { clear(); }; return Row(all, none);
         }
         private static FlowLayoutPanel Row(params Control[] controls)
         {
-            FlowLayoutPanel panel = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = Padding.Empty };
+            FlowLayoutPanel panel = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = Padding.Empty, BackColor = Surface };
             panel.Controls.AddRange(controls); return panel;
         }
         private static Button CreateHelpButton(string name, string title, string guidance)
         {
-            Button button = ActionButton("?");
-            button.Name = name; button.AccessibleName = title + " help";
-            button.AccessibleDescription = guidance;
-            button.Size = new Size(28, 28); button.Margin = new Padding(0, 0, 0, 8);
-            button.Font = new Font("Segoe UI", 10, FontStyle.Bold);
-            button.ForeColor = Accent; button.FlatAppearance.BorderSize = 0;
-            button.FlatAppearance.MouseOverBackColor = Color.FromArgb(49, 63, 67);
-            button.Click += delegate { MessageBox.Show(button.FindForm(), guidance, title,
-                MessageBoxButtons.OK, MessageBoxIcon.Information); };
-            return button;
+            Button button = ActionButton("?"); button.Name = name; button.AccessibleName = title + " help"; button.AccessibleDescription = guidance;
+            button.Size = new Size(26, 26); button.ForeColor = Color.FromArgb(139, 155, 166); button.FlatAppearance.BorderSize = 0;
+            button.Click += delegate { MessageBox.Show(button.FindForm(), guidance, title, MessageBoxButtons.OK, MessageBoxIcon.Information); }; return button;
         }
         private static Control ActionSection(string title, Control content, string note)
         {
-            TableLayoutPanel card = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface,
-                Padding = new Padding(12), Margin = new Padding(0, 0, 10, 12), ColumnCount = 1, RowCount = 2 };
-            card.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-            card.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            TableLayoutPanel heading = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
-            heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            heading.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 30));
-            heading.Controls.Add(new Label { Text = title, AutoSize = true, ForeColor = Color.FromArgb(167, 181, 194),
-                Font = new Font("Segoe UI", 10f, FontStyle.Bold), Margin = new Padding(0, 4, 0, 0) });
+            SurfaceCard card = new SurfaceCard { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 14, 0) };
+            TableLayoutPanel inside = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface, ColumnCount = 1, RowCount = 2, Margin = Padding.Empty };
+            inside.RowStyles.Add(new RowStyle(SizeType.Absolute, 47)); inside.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            TableLayoutPanel heading = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface, ColumnCount = 2, Margin = Padding.Empty };
+            heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); heading.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 28));
+            heading.Controls.Add(new Label { Text = title, AutoSize = true, ForeColor = Color.FromArgb(222, 230, 235), Font = new Font("Segoe UI Semibold", 11), Margin = new Padding(0, 4, 0, 0) });
             if (note != null) heading.Controls.Add(CreateHelpButton(title == "EQUIP GEAR" ? "gearHelp" : "waspsHelp", title, note));
-            card.Controls.Add(heading); card.Controls.Add(content);
-            return card;
+            inside.Controls.Add(heading); inside.Controls.Add(content); card.Controls.Add(inside); return card;
         }
         private static Control ActionRow(Control left, Control right)
         {
-            TableLayoutPanel row = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, Margin = new Padding(0, 4, 0, 4) };
+            TableLayoutPanel row = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = new Padding(0, 16, 14, 0) };
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50)); row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-            left.Anchor = AnchorStyles.Left; right.Anchor = AnchorStyles.Right;
-            row.Controls.Add(left, 0, 0); row.Controls.Add(right, 1, 0); return row;
+            left.Anchor = AnchorStyles.Left; right.Anchor = AnchorStyles.Right; row.Controls.Add(left, 0, 0); row.Controls.Add(right, 1, 0); return row;
         }
         private void Append(string text)
         {
@@ -399,15 +625,17 @@ namespace TinnosDebloat
         }
         private void Busy(bool busy)
         {
-            foreach (Control item in new Control[] { equipment, cleanup, start, deviceType, manufacturer, wallpaperButton, lockScreenButton, clearImagesButton }) item.Enabled = !busy;
+            foreach (Control item in new Control[] { equipment, cleanupHost, start, deviceType, manufacturer }) item.Enabled = !busy;
+            foreach (Button button in selectionButtons) button.Enabled = !busy;
+            progress.Visible = busy;
             manufacturer.Enabled = !busy && deviceType.SelectedIndex == 1;
             progress.Style = busy ? ProgressBarStyle.Marquee : ProgressBarStyle.Blocks;
         }
         public string SelectedConfiguration()
         {
             List<string> install = new List<string>(), remove = new List<string>();
-            foreach (CleanupItem item in equipment.CheckedItems) install.Add(item.Id);
-            foreach (CleanupItem item in cleanup.CheckedItems) remove.Add(item.Id);
+            foreach (CleanupItem item in equipment.CheckedItems) if (item.Id != "Wallpaper" && item.Id != "LockScreen") install.Add(item.Id);
+            foreach (CleanupItem item in cleanupItems) if (IsAvailable(item) && cleanupSelection[item.Id]) remove.Add(item.Id);
             Dictionary<string, object> config = new Dictionary<string, object> {
                 { "LicenseEdition", "Business" }, { "Architecture", "64" }, { "Languages", new string[] { "pt-br" } }, { "Channel", "Current" },
                 { "InstallItems", install.ToArray() }, { "RemoveItems", remove.ToArray() }
@@ -416,14 +644,15 @@ namespace TinnosDebloat
             if (lockScreenPath != "") config.Add("LockScreenPath", lockScreenPath);
             return ResultChannel.Serializer().Serialize(config);
         }
+        private bool HasSelectedCleanup() { foreach (CleanupItem item in cleanupItems) if (IsAvailable(item) && cleanupSelection[item.Id]) return true; return false; }
         private void Run()
         {
             if (running != null) return;
             try
             {
-                if (equipment.CheckedItems.Count == 0 && cleanup.CheckedItems.Count == 0 && wallpaperPath == "" && lockScreenPath == "") {
+                if (equipment.CheckedItems.Count == 0 && !HasSelectedCleanup() && wallpaperPath == "" && lockScreenPath == "") {
                     status.Text = "Nothing selected. Mark the actions you want to execute.";
-                    Append(status.Text); return;
+                    Append(status.Text); SetDetails(true); return;
                 }
                 string config = SelectedConfiguration();
                 directory = Payload.Extract(); output = Path.Combine(directory, "Work");
