@@ -14,7 +14,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("TinnosDebloat-Win11")]
 [assembly: AssemblyDescription("Windows 11 provisioning and Teams removal")]
-[assembly: AssemblyVersion("2.6.0.0")]
+[assembly: AssemblyVersion("2.7.0.0")]
 
 namespace TinnosDebloat
 {
@@ -201,6 +201,11 @@ namespace TinnosDebloat
         private readonly TabControl detailTabs = new TabControl { Name = "detailTabs", Dock = DockStyle.Fill, Visible = false };
         private readonly Label status = new Label { Name = "currentTask", Text = "Ready - select actions, then Start.", Dock = DockStyle.Fill, Height = 42, ForeColor = Color.Gainsboro, Margin = new Padding(0, 10, 0, 8) };
         private readonly ProgressBar progress = new ProgressBar { Dock = DockStyle.Fill, Height = 4 };
+        private readonly Button wallpaperButton = ActionButton("Wallpaper...");
+        private readonly Button lockScreenButton = ActionButton("Lock screen...");
+        private readonly Button clearImagesButton = ActionButton("Clear images");
+        private readonly Label imageSelection = new Label { Name = "imageSelection", AutoSize = false, Height = 52, Dock = DockStyle.Fill, AutoEllipsis = true, ForeColor = Color.Silver };
+        private string wallpaperPath = "", lockScreenPath = "";
         private Process running;
         private string directory, output;
         private bool receivedResult;
@@ -235,9 +240,25 @@ namespace TinnosDebloat
             equipment.Items.Add(new CleanupItem { Id = "GoogleDrive", Label = "Install Google Drive" }, true);
             equipment.Items.Add(new CleanupItem { Id = "Office", Label = "Install Microsoft 365 Office" }, true);
             equipment.Items.Add(new CleanupItem { Id = "Chrome", Label = "Install Google Chrome" }, true);
+            equipment.Items.Add(new CleanupItem { Id = "TranslucentTB", Label = "Install TranslucentTB" }, false);
+            TableLayoutPanel gearPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Margin = Padding.Empty };
+            gearPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            gearPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+            gearPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+            gearPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+            wallpaperButton.Name = "wallpaperButton"; lockScreenButton.Name = "lockScreenButton"; clearImagesButton.Name = "clearImagesButton";
+            wallpaperButton.Width = 145; lockScreenButton.Width = 145; clearImagesButton.Width = 145;
+            wallpaperButton.Margin = new Padding(0, 0, 8, 0);
+            wallpaperButton.Click += delegate { PickImage(false); };
+            lockScreenButton.Click += delegate { PickImage(true); };
+            clearImagesButton.Click += delegate { SetImageSelections("", ""); };
+            gearPanel.Controls.Add(equipment);
+            gearPanel.Controls.Add(Row(wallpaperButton, lockScreenButton));
+            gearPanel.Controls.Add(clearImagesButton); gearPanel.Controls.Add(imageSelection);
+            SetImageSelections("", "");
             TableLayoutPanel choices = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
             choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36)); choices.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 64));
-            choices.Controls.Add(ActionSection("EQUIP GEAR", equipment, "Office: PT-BR, 64-bit. Word, Excel, PowerPoint. Teams, OneNote, OneDrive, Access and Outlook excluded."));
+            choices.Controls.Add(ActionSection("EQUIP GEAR", gearPanel, "Office: PT-BR, 64-bit. Word, Excel, PowerPoint. Teams, OneNote, OneDrive, Access and Outlook excluded.\n\nTranslucentTB installs from Microsoft Store for the account running this app. Store/App Installer must be available.\n\nWallpaper and Lock screen open the Windows file picker. Choose a JPG, PNG or BMP; selections apply to the account running this app only after Start. A custom wallpaper overrides the Moss background selection. Clear images cancels pending image changes."));
             deviceType.Items.AddRange(new object[] { "Desktop", "Laptop" });
             manufacturer.Items.AddRange(new object[] { "Other / None", "ASUS", "Dell" });
             deviceType.SelectedIndex = 0; manufacturer.SelectedIndex = 0; manufacturer.Enabled = false;
@@ -246,14 +267,14 @@ namespace TinnosDebloat
             wasps.Controls.Add(Row(new Label { Text = "Device", AutoSize = true, Padding = new Padding(0, 5, 5, 0) }, deviceType,
                 new Label { Text = "Brand", AutoSize = true, Padding = new Padding(10, 5, 5, 0) }, manufacturer));
             wasps.Controls.Add(cleanup);
-            choices.Controls.Add(ActionSection("REMOVE WASPS", wasps, "Uninstall removes an app. Deactivate stops and disables a service. Windows may require sign-out or restart.\n\nDesktop excludes ASUS and Dell utilities. For a laptop, choose its brand to select matching utilities. Review these before Start: some affect battery settings or recovery. Armoury Crate requires ASUS's official uninstall tool.\n\nFull Search UI blocking requires updated Windows 11 Pro or higher and a restart. Indexing is a separate action."));
+            choices.Controls.Add(ActionSection("REMOVE WASPS", wasps, "Uninstall removes an app. Deactivate stops and disables a service. Windows may require sign-out or restart.\n\nDesktop excludes ASUS and Dell utilities. For a laptop, choose its brand to select matching utilities. Review these before Start: some affect battery settings or recovery. Armoury Crate requires ASUS's official uninstall tool.\n\nFull Search UI blocking requires updated Windows 11 Pro or higher and a restart. Indexing is a separate action.\n\nOptional ASUS and AMD services are unchecked by default: disabling them can affect hotkeys, battery settings, display profiles or GPU crash recovery. Cryptographic Services (CryptSvc) is not BitLocker; disabling it can break Windows Update and signature verification. Services with active dependencies are not force-stopped.\n\nEmpty Start menu clears pinned apps and hides Recommended and All apps on supported updated Windows 11 Pro+ builds. Sign out or restart afterward. The empty-state wording depends on your Windows version. No installed apps or shortcuts are deleted."));
             layout.Controls.Add(choices);
             using (Stream data = Assembly.GetExecutingAssembly().GetManifestResourceStream("Payload.debloat-catalog.json"))
             using (StreamReader reader = new StreamReader(data)) {
                 foreach (object entry in (object[])ResultChannel.Serializer().DeserializeObject(reader.ReadToEnd())) {
                     Dictionary<string, object> item = (Dictionary<string, object>)entry;
                     CleanupItem choice = new CleanupItem { Id = TextValue(item, "Id"), Label = TextValue(item, "Name"), Vendor = TextValue(item, "Vendor"), DefaultSelected = !(Value(item, "DefaultSelected") is bool) || (bool)Value(item, "DefaultSelected") };
-                    cleanupItems.Add(choice); cleanupSelection[choice.Id] = choice.Vendor == "Dell" || choice.Vendor == "ASUS" || choice.DefaultSelected;
+                    cleanupItems.Add(choice); cleanupSelection[choice.Id] = ((choice.Vendor == "Dell" || choice.Vendor == "ASUS") && (!(Value(item, "SelectWithVendor") is bool) || (bool)Value(item, "SelectWithVendor"))) || choice.DefaultSelected;
                 }
             }
             RefreshCleanup();
@@ -273,6 +294,26 @@ namespace TinnosDebloat
             FormClosing += delegate(object sender, FormClosingEventArgs e) {
                 if (running != null) { e.Cancel = true; status.Text = "An operation is running. Wait for the result."; }
             };
+        }
+        private void PickImage(bool lockScreen)
+        {
+            using (OpenFileDialog picker = new OpenFileDialog { Title = lockScreen ? "Choose lock-screen image" : "Choose wallpaper",
+                Filter = "Images (*.jpg;*.jpeg;*.png;*.bmp)|*.jpg;*.jpeg;*.png;*.bmp", CheckFileExists = true, Multiselect = false }) {
+                if (picker.ShowDialog(this) != DialogResult.OK) return;
+                try {
+                    using (Image selected = Image.FromFile(picker.FileName)) {
+                        if (selected.Width < 1 || selected.Height < 1) throw new InvalidDataException("Invalid image.");
+                    }
+                    SetImageSelections(lockScreen ? wallpaperPath : picker.FileName, lockScreen ? picker.FileName : lockScreenPath);
+                } catch (Exception error) { MessageBox.Show(this, error.Message, "Cannot open image", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            }
+        }
+        public void SetImageSelections(string wallpaper, string lockScreen)
+        {
+            wallpaperPath = wallpaper ?? ""; lockScreenPath = lockScreen ?? "";
+            imageSelection.Text = "Wallpaper: " + (wallpaperPath == "" ? "Unchanged" : Path.GetFileName(wallpaperPath))
+                + Environment.NewLine + "Lock screen: " + (lockScreenPath == "" ? "Unchanged" : Path.GetFileName(lockScreenPath));
+            imageSelection.AccessibleDescription = "Wallpaper: " + wallpaperPath + "; Lock screen: " + lockScreenPath;
         }
         private void RefreshCleanup()
         {
@@ -358,7 +399,7 @@ namespace TinnosDebloat
         }
         private void Busy(bool busy)
         {
-            foreach (Control item in new Control[] { equipment, cleanup, start, deviceType, manufacturer }) item.Enabled = !busy;
+            foreach (Control item in new Control[] { equipment, cleanup, start, deviceType, manufacturer, wallpaperButton, lockScreenButton, clearImagesButton }) item.Enabled = !busy;
             manufacturer.Enabled = !busy && deviceType.SelectedIndex == 1;
             progress.Style = busy ? ProgressBarStyle.Marquee : ProgressBarStyle.Blocks;
         }
@@ -367,17 +408,20 @@ namespace TinnosDebloat
             List<string> install = new List<string>(), remove = new List<string>();
             foreach (CleanupItem item in equipment.CheckedItems) install.Add(item.Id);
             foreach (CleanupItem item in cleanup.CheckedItems) remove.Add(item.Id);
-            return ResultChannel.Serializer().Serialize(new Dictionary<string, object> {
+            Dictionary<string, object> config = new Dictionary<string, object> {
                 { "LicenseEdition", "Business" }, { "Architecture", "64" }, { "Languages", new string[] { "pt-br" } }, { "Channel", "Current" },
                 { "InstallItems", install.ToArray() }, { "RemoveItems", remove.ToArray() }
-            });
+            };
+            if (wallpaperPath != "") config.Add("WallpaperPath", wallpaperPath);
+            if (lockScreenPath != "") config.Add("LockScreenPath", lockScreenPath);
+            return ResultChannel.Serializer().Serialize(config);
         }
         private void Run()
         {
             if (running != null) return;
             try
             {
-                if (equipment.CheckedItems.Count == 0 && cleanup.CheckedItems.Count == 0) {
+                if (equipment.CheckedItems.Count == 0 && cleanup.CheckedItems.Count == 0 && wallpaperPath == "" && lockScreenPath == "") {
                     status.Text = "Nothing selected. Mark the actions you want to execute.";
                     Append(status.Text); return;
                 }

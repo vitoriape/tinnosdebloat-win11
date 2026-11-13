@@ -799,7 +799,7 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
             Assert (!@($controls | Where-Object {$_ -is [Windows.Forms.CheckBox] -or $_ -is [Windows.Forms.RadioButton]}).Count) 'Old app-action or Office toggles remain.'
             Assert ('EQUIP GEAR' -in $controls.Text -and 'REMOVE WASPS' -in $controls.Text) 'Action headings missing.'
             $gear=$form.Controls.Find('installList',$true)[0]
-            Assert ($gear.Items.Count -eq 3 -and $gear.CheckedItems.Count -eq 3) 'Equipment choices missing.'
+            Assert ($gear.Items.Count -eq 4 -and $gear.CheckedItems.Count -eq 3) 'Equipment choices missing.'
             $choices=$form.Controls.Find('removalList',$true)[0]
             Assert ($choices.Items.Count -eq @((Get-Content (Join-Path $root 'debloat-catalog.json') -Raw | ConvertFrom-Json) | Where-Object {$_.PSObject.Properties['Vendor'] -eq $null -or $_.Vendor -notin @('Dell','ASUS')}).Count) 'Removal choices differ from the engine catalog.'
             Assert ($choices.CheckedItems.Count -lt $choices.Items.Count) 'High impact services must require selection.'
@@ -815,7 +815,7 @@ $sample='Vit'+[char]0x00f3+'ria '+[char]0x2014+' '+[char]0x65e5
             Assert ($null -eq $selected.PSObject.Properties['IncludeAccess'] -and $null -eq $selected.PSObject.Properties['AppMode']) 'Removed configuration options still generated.'
             Assert ($form.Controls.Find('detailTabs',$true)[0].TabPages.Count -eq 2) 'Results tab remains.'
             $actions=@($controls | Where-Object {$_ -is [Windows.Forms.Button]})
-            Assert ($actions.Count -eq 5 -and 'Start' -in $actions.Text -and 'Details' -in $actions.Text)  'Unexpected action buttons.'
+            Assert ($actions.Count -eq 8 -and 'Start' -in $actions.Text -and 'Details' -in $actions.Text)  'Unexpected action buttons.'
             foreach ($name in @('selectionHelp','gearHelp','waspsHelp')) {
                 $help=$form.Controls.Find($name,$true)[0]
                 Assert ($help.Text -eq '?' -and $help.AccessibleDescription.Length -gt 30) 'Contextual help guidance missing.'

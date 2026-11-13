@@ -95,7 +95,7 @@ function Get-OfficeProductId([string]$LicenseEdition) {
 function Read-DeploymentConfig([string]$Path) {
     $inputConfig = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
     if ($null -eq $inputConfig -or $inputConfig -isnot [pscustomobject]) { throw (New-TinnosError 'TNO-100' 'Configuration must be a JSON object.') }
-    $allowed = @('LicenseEdition','Architecture','Languages','Channel','AppMode','InstallItems','RemoveItems')
+    $allowed = @('LicenseEdition','Architecture','Languages','Channel','AppMode','InstallItems','RemoveItems','WallpaperPath','LockScreenPath')
     foreach ($property in $inputConfig.PSObject.Properties) {
         $key = $property.Name
         if ($key -notin $allowed) { throw "Unknown configuration field: $key" }
@@ -112,11 +112,18 @@ function Read-DeploymentConfig([string]$Path) {
     if ($channel -notin @('Current','MonthlyEnterprise','SemiAnnual','SemiAnnualPreview','CurrentPreview','BetaChannel')) { throw 'Unsupported Office channel.' }
     $installItems = @(Get-Value $inputConfig 'InstallItems' @('Office','Chrome','GoogleDrive'))
     foreach ($id in $installItems) {
-        if ($id -isnot [string] -or $id -cnotin @('Office','Chrome','GoogleDrive')) {throw (New-TinnosError 'TNO-100' "Unknown installation selection: $id")}
+        if ($id -isnot [string] -or $id -cnotin @('Office','Chrome','GoogleDrive','TranslucentTB')) {throw (New-TinnosError 'TNO-100' "Unknown installation selection: $id")}
     }
     $removeItems = @(Get-Value $inputConfig 'RemoveItems' @($script:DebloatCatalog | Where-Object {(Get-Value $_ 'DefaultSelected' $true)} | ForEach-Object {$_.Id}))
     foreach ($id in $removeItems) {
         if ($id -isnot [string] -or $id -cnotin @($script:DebloatCatalog.Id)) { throw (New-TinnosError 'TNO-100' "Unknown removal selection: $id") }
+    }
+    foreach ($field in @('WallpaperPath','LockScreenPath')) {
+        $value=Get-Value $inputConfig $field ''
+        if ($value -isnot [string]) {throw (New-TinnosError 'TNO-100' "$field must be an image file path.")}
+        if ($value -and (!(Test-Path -LiteralPath $value -PathType Leaf) -or [IO.Path]::GetExtension($value) -notin @('.jpg','.jpeg','.png','.bmp'))) {
+            throw (New-TinnosError 'TNO-100' "$field must point to an existing JPG, PNG or BMP file.")
+        }
     }
     $removeItems = @($removeItems | Select-Object -Unique)
     [pscustomobject]@{
@@ -125,6 +132,8 @@ function Read-DeploymentConfig([string]$Path) {
         AppMode=$appMode
         InstallItems=@($installItems | Select-Object -Unique)
         RemoveItems=$removeItems
+        WallpaperPath=(Get-Value $inputConfig 'WallpaperPath' '')
+        LockScreenPath=(Get-Value $inputConfig 'LockScreenPath' '')
         IncludeAccess=$false; ExcludeOneDrive=$true; ExcludeNewOutlook=$true
     }
 }
@@ -901,6 +910,22 @@ function Get-DeploymentChecks($Config, $Office, $Teams, $Policies, $Google, [str
     })
     $checks+=[pscustomobject]@{Name='SelectedActions';Pass=$true;Required=$true;Category='Selection';Detail=[pscustomobject]@{InstallItems=$installItems;RemoveItems=$removeItems}}
     foreach ($app in $Applications) {
+        if ($app.Action -eq 'ConfigureImage') {
+            $verified=$false
+            try {$verified=Test-SelectedImage $app.Name (Get-Value $app.Detail 'Artifact' '')} catch {$verified=$false}
+            $checks+=[pscustomobject]@{Name=$app.Name;Pass=($app.Status -eq 'Configured' -and $verified);Required=$true;Category='Personalization';Detail=$app;ErrorCode='TNO-503'}
+            continue
+        }
+        if ($app.Name -eq 'TranslucentTB') {
+            $verified=$false
+            try {
+                if ($Config.AppMode -eq 'Download') {$artifact=Get-Value $app.Detail 'Artifact' ''; $verified=$app.Status -eq 'Downloaded' -and $artifact -and (Test-Path -LiteralPath $artifact -PathType Leaf)}
+                else {$verified=$app.Status -in @('Installed','AlreadyInstalled') -and @(Get-TranslucentTBPackage).Count -gt 0}
+            } catch {$verified=$false}
+            $checks+=[pscustomobject]@{Name='TranslucentTB';Pass=[bool]$verified;Required=$true;Category='Application';Detail=$app;ErrorCode='TNO-404'}
+            continue
+        }
+
         if ($app.Action -eq 'RemoveRdc') {
             $pass=$false;$evidence=$app
             try {$state=Get-RemoteDesktopConnectionState;$pass=!$state.Present -and $app.Status -ne 'Failed';$evidence=$state} catch {$evidence=[string]$_}
@@ -1203,7 +1228,9 @@ function Remove-DesktopUtility([string]$Id, [string]$Directory, [switch]$UserCon
 function Assert-LocalDesktopSettings([string]$Setting, [string]$Hive) {
     # Inspect effective policy for this preference, not blanket domain membership.
     # Existing GPO/MDM values are never changed by the preference writer.
+    if ($Setting -eq 'EmptyStartMenu') {Assert-StartMenuSupport}
     $rules=@(switch ($Setting) {
+        'EmptyStartMenu' {,@('Software\Policies\Microsoft\Windows\Explorer','ConfigureStartPins','{"pinnedList":[]}');,@('Software\Policies\Microsoft\Windows\Explorer','HideRecommendedSection',1);,@('Software\Microsoft\Windows\CurrentVersion\Policies\Explorer','NoStartMenuMorePrograms',1)}
         'DesktopIcons' {,@('Software\Microsoft\Windows\CurrentVersion\Policies\Explorer','NoDesktop',1)}
         'TaskbarSearch' {,@('Software\Policies\Microsoft\Windows\Windows Search','SearchOnTaskbarMode',0)}
         'TaskbarWidgets' {,@('Software\Policies\Microsoft\Dsh','AllowNewsAndInterests',0)}
@@ -1230,6 +1257,7 @@ function Assert-LocalDesktopSettings([string]$Setting, [string]$Hive) {
         }
     }
     $mdm=@(switch ($Setting) {
+        'EmptyStartMenu' {,@('Start','ConfigureStartPins','{"pinnedList":[]}');,@('Start','HideRecommendedSection',1);,@('Start','HideAppList',3)}
         'TaskbarSearch' {,@('Search','ConfigureSearchOnTaskbarMode',0)}
         'TaskbarWidgets' {,@('NewsAndInterests','AllowNewsAndInterests',0)}
         'BackgroundMoss' {,@('Personalization','DesktopImageUrl','')}
@@ -1256,6 +1284,11 @@ function Get-DesktopPreferenceValues([string]$Setting) {
     $advanced='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
     $personalize='Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
     $values=@(switch ($Setting) {
+        'EmptyStartMenu' {
+            ,@('Software\Policies\Microsoft\Windows\Explorer','ConfigureStartPins','{"pinnedList":[]}', 'String')
+            ,@('Software\Policies\Microsoft\Windows\Explorer','HideRecommendedSection',1,'DWord')
+            ,@('Software\Microsoft\Windows\CurrentVersion\Policies\Explorer','NoStartMenuMorePrograms',1,'DWord')
+        }
         'DesktopIcons' {,@($advanced,'HideIcons',1,'DWord')}
         'TaskbarSearch' {,@('Software\Microsoft\Windows\CurrentVersion\Search','SearchboxTaskbarMode',0,'DWord')}
         'TaskbarWidgets' {,@($advanced,'TaskbarDa',0,'DWord')}
@@ -1351,7 +1384,7 @@ function Test-DesktopSettingState([string]$Setting) {
     return $true
 }
 
-function Set-SelectedDesktopSetting([ValidateSet('DesktopIcons','TaskbarSearch','TaskbarWidgets','DarkMode','AccentGold','BackgroundMoss','DisableSearchUI')][string]$Setting) {
+function Set-SelectedDesktopSetting([ValidateSet('DesktopIcons','TaskbarSearch','TaskbarWidgets','DarkMode','AccentGold','BackgroundMoss','DisableSearchUI','EmptyStartMenu')][string]$Setting) {
     if ($Setting -eq 'DisableSearchUI') {
         Assert-SearchUiSupport
         Set-VerifiedDword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'DisableSearch' 1 -Policy
@@ -1375,6 +1408,7 @@ function Set-SelectedDesktopSetting([ValidateSet('DesktopIcons','TaskbarSearch',
             Send-DeploymentEvent 'Success' $Setting "Preferences verified for $($profile.SID). Sign out and back in if the shell still shows its cached state. No files were deleted."
         } catch {$failed=$true;Add-RunIssue (New-DeploymentIssue 'TNO-503' $_.Exception.Message "$Setting - $($profile.SID)" 'Error' $_)}
     }
+    if ($Setting -eq 'EmptyStartMenu') {$script:Report.RebootRequired=$true}
     if ($failed) {throw (New-TinnosError 'TNO-503' "$Setting could not be configured for every applicable profile. Review policy/profile errors, then retry.")}
     return [pscustomobject]@{Status='Configured';Apply='Current account refresh requested; other profiles next sign-in';Setting=$Setting;Profiles=$applied}
 }
@@ -1392,6 +1426,7 @@ function Invoke-SelectedDebloat($Config, [string]$Directory) {
         }
         if (Get-Value $item 'DesktopProducts') {Invoke-ApplicationStep $item.Id 'RemoveDesktop' {Remove-DesktopUtility $item.Id $Directory}}
         if ((Get-Value $item 'WindowsApp') -eq 'RemoteDesktopConnection') {Invoke-ApplicationStep $item.Id 'RemoveRdc' {Remove-RemoteDesktopConnection}}
+        if ($item.Id -eq 'BackgroundMoss' -and (Get-Value $Config 'WallpaperPath' '')) {continue}
         if (Get-Value $item 'Setting') { Invoke-ApplicationStep $item.Name 'Configure' {Set-SelectedDesktopSetting $item.Setting} }
         $remaining--
     }
@@ -1401,7 +1436,7 @@ function Invoke-DeploymentSteps($Config, $Office, $Teams, $Policies, [string]$Xm
     $installItems=@(Get-Value $Config 'InstallItems' @('Office','Chrome','GoogleDrive'))
     $removeItems=@(Get-Value $Config 'RemoveItems' @())
     Send-DeploymentEvent 'Task' 'Selected actions' ("Install: {0}. Remove/configure: {1}. Unchecked items will be left alone." -f ($installItems -join ', '),($removeItems -join ', '))
-    if (!$installItems.Count -and !$removeItems.Count) {Send-DeploymentEvent 'Success' 'Selection' 'Nothing selected; no system changes requested.';return}
+    if (!$installItems.Count -and !$removeItems.Count -and !(Get-Value $Config 'WallpaperPath' '') -and !(Get-Value $Config 'LockScreenPath' '')) {Send-DeploymentEvent 'Success' 'Selection' 'Nothing selected; no system changes requested.';return}
     $script:Report.Steps += 'Create or verify a Windows restore point before deployment changes'
     $restoreOk = Invoke-MaintenanceStep 'Restore point' {$script:Report.RestorePoint = New-DeploymentRestorePoint} 'TNO-201'
     if (!$restoreOk) {
@@ -1447,6 +1482,15 @@ function Invoke-DeploymentSteps($Config, $Office, $Teams, $Policies, [string]$Xm
     if ('GoogleDrive' -in $installItems) {
     $script:Report.Steps += "7 $($Config.AppMode) Google Drive for desktop"
     Invoke-ApplicationStep 'GoogleDrive' $Config.AppMode { Install-GoogleDrive $Directory -DownloadOnly:($Config.AppMode -eq 'Download') }
+    }
+    if ('TranslucentTB' -in $installItems) {
+        Invoke-ApplicationStep 'TranslucentTB' $Config.AppMode {Install-TranslucentTB $Directory -DownloadOnly:($Config.AppMode -eq 'Download')}
+    }
+    if ($Config.AppMode -eq 'Install') {
+        foreach ($kind in @('Wallpaper','LockScreen')) {
+            $imagePath=Get-Value $Config ($kind+'Path') ''
+            if ($imagePath) {Invoke-ApplicationStep $kind 'ConfigureImage' {Set-SelectedImage $kind $imagePath $Directory}}
+        }
     }
     if ($Config.AppMode -eq 'Install' -and 'Chrome' -in $installItems) {
         $script:Report.Steps += '8 Configure Chrome defaults with supported Windows mechanisms'
@@ -1619,6 +1663,127 @@ function Invoke-CorporateProvisioning([string]$ConfigPath, [ValidateSet('Audit',
         $script:Report.Steps += '10 Return results to the application in memory'
         [pscustomobject]@{ Status=$script:Report.Status; Report=$script:Report }
     } finally { if ($locked) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
+}
+
+function Get-TranslucentTBPackage {
+    @(Get-AppxPackage -Name '28017CharlesMilette.TranslucentTB' -ErrorAction Stop | Where-Object {$_.Name -eq '28017CharlesMilette.TranslucentTB' -and $_.Publisher -eq 'CN=04797BBC-C7BB-462F-9B66-331C81E27C0E'})
+}
+
+function Install-TranslucentTB([string]$Directory, [switch]$DownloadOnly) {
+    if ($DownloadOnly) {
+        $url='https://github.com/TranslucentTB/TranslucentTB/releases/latest/download/TranslucentTB.appinstaller'
+        $path=Join-Path $Directory 'TranslucentTB.appinstaller'
+        try {
+            Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $path -TimeoutSec 60
+            $settings=New-Object Xml.XmlReaderSettings; $settings.DtdProcessing=[Xml.DtdProcessing]::Prohibit; $settings.XmlResolver=$null
+            $reader=[Xml.XmlReader]::Create($path,$settings)
+            try {$document=New-Object Xml.XmlDocument;$document.XmlResolver=$null;$document.Load($reader)} finally {$reader.Dispose()}
+            $bundle=$document.DocumentElement.MainBundle
+            if (!$bundle -or [string]$bundle.Name -ne '28017CharlesMilette.TranslucentTB' -or [string]$bundle.Uri -notmatch '^https://github\.com/TranslucentTB/TranslucentTB/releases/download/') {
+                throw 'Unexpected official TranslucentTB appinstaller manifest.'
+            }
+        } catch {if (Test-Path -LiteralPath $path) {Remove-Item -LiteralPath $path -Force};throw}
+        return [pscustomobject]@{Status='Downloaded';Artifact=$path;Reason='Official appinstaller downloaded, not offline application media. Open it as the intended user to download and install the signed app and dependencies.'}
+    }
+    if (@(Get-TranslucentTBPackage).Count) {return [pscustomobject]@{Status='AlreadyInstalled';Scope='Current account'}}
+    $installer=Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction Stop | Select-Object -First 1
+    if (!$installer) {throw (New-TinnosError 'TNO-404' 'Install or update Microsoft App Installer from Microsoft Store, then retry TranslucentTB as the intended user.')}
+    $winget=Join-Path $installer.InstallLocation 'winget.exe'
+    Assert-Publisher $winget 'Microsoft'
+    $null=Invoke-Installer $winget 'install --id 9PF4KZ2VN4W9 --source msstore --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity' @(0)
+    if (!@(Get-TranslucentTBPackage).Count) {throw (New-TinnosError 'TNO-404' 'TranslucentTB installation was not verified for the current account. Review Microsoft Store/App Installer policy or install it from Microsoft Store as the intended user.')}
+    return [pscustomobject]@{Status='Installed';Scope='Current account';Source='Microsoft Store 9PF4KZ2VN4W9'}
+}
+
+function Assert-ImagePolicy([ValidateSet('Wallpaper','LockScreen')][string]$Kind) {
+    if ($Kind -eq 'Wallpaper') {Assert-LocalDesktopSettings BackgroundMoss 'HKCU:'}
+    $checks=if ($Kind -eq 'LockScreen') {
+        @(@('SOFTWARE\Policies\Microsoft\Windows\Personalization','LockScreenImage'),@('SOFTWARE\Policies\Microsoft\Windows\Personalization','NoChangingLockScreen'),@('SOFTWARE\Microsoft\PolicyManager\current\device\Personalization','LockScreenImageUrl'))
+    } else {@(@('SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System','Wallpaper'),@('SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop','NoChangingWallPaper'),@('SOFTWARE\Microsoft\PolicyManager\current\device\Personalization','DesktopImageUrl'))}
+    foreach ($root in @('HKLM:','HKCU:')) {
+        foreach ($check in $checks) {
+            $key="$root\$($check[0])"
+            if (Test-Path -LiteralPath $key) {
+                $value=Get-Value (Get-ItemProperty -LiteralPath $key -ErrorAction Stop) $check[1]
+                if ($null -ne $value -and [string]$value -notin @('','0')) {throw (New-TinnosError 'TNO-202' "$Kind is managed by $($check[1]). Existing policy was preserved.")}
+            }
+        }
+    }
+}
+
+function New-PersonalizationImage([string]$Path,[string]$Directory) {
+    if ([IO.Path]::GetExtension($Path) -notin @('.jpg','.jpeg','.png','.bmp') -or !(Test-Path -LiteralPath $Path -PathType Leaf)) {throw (New-TinnosError 'TNO-100' 'Select an existing JPG, PNG or BMP image.')}
+    Add-Type -AssemblyName System.Drawing
+    $image=[Drawing.Image]::FromFile([IO.Path]::GetFullPath($Path))
+    try {
+        if ($image.Width -lt 1 -or $image.Height -lt 1 -or ([long]$image.Width*$image.Height) -gt 100000000) {throw (New-TinnosError 'TNO-100' 'Image dimensions are invalid or exceed 100 megapixels.')}
+        $assets=Join-Path $Directory 'Personalization'; $null=New-Item -Path $assets -ItemType Directory -Force
+        $hash=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+        $target=Join-Path $assets ($hash+'.jpg')
+        $image.Save($target,[Drawing.Imaging.ImageFormat]::Jpeg)
+        return $target
+    } finally {$image.Dispose()}
+}
+
+function Wait-WinRtResult($Operation,[type]$ResultType) {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $method=[System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {$_.Name -eq 'AsTask' -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'} | Select-Object -First 1
+    $task=$method.MakeGenericMethod($ResultType).Invoke($null,@($Operation))
+    $task.GetAwaiter().GetResult()
+}
+
+function Get-LockScreenImageHash {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $null=[Windows.System.UserProfile.LockScreen,Windows.System.UserProfile,ContentType=WindowsRuntime]
+    $stream=[Windows.System.UserProfile.LockScreen]::GetImageStream()
+    if ($null -eq $stream) {return ''}
+    $read=[System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($stream)
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try {return ([BitConverter]::ToString($sha.ComputeHash($read))).Replace('-','')} finally {$sha.Dispose();$read.Dispose();$stream.Dispose()}
+}
+
+function Set-LockScreenImage([string]$Path) {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $fileType=[Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime]
+    $null=[Windows.System.UserProfile.LockScreen,Windows.System.UserProfile,ContentType=WindowsRuntime]
+    $file=Wait-WinRtResult ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) $fileType
+    $operation=[Windows.System.UserProfile.LockScreen]::SetImageFileAsync($file)
+    $method=[System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {$_.Name -eq 'AsTask' -and !$_.IsGenericMethod -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction'} | Select-Object -First 1
+    $task=$method.Invoke($null,@($operation)); $task.GetAwaiter().GetResult()
+}
+
+function Test-SelectedImage([string]$Kind,[string]$Path) {
+    if (!$Path -or !(Test-Path -LiteralPath $Path -PathType Leaf)) {return $false}
+    Assert-ImagePolicy $Kind
+    if ($Kind -eq 'Wallpaper') {
+        return [string](Get-Value (Get-ItemProperty -LiteralPath 'HKCU:\Control Panel\Desktop' -ErrorAction Stop) 'Wallpaper') -ceq $Path
+    }
+    if ($Kind -eq 'LockScreen') {return (Get-LockScreenImageHash) -eq (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash}
+    return $false
+}
+
+function Set-SelectedImage([ValidateSet('Wallpaper','LockScreen')][string]$Kind,[string]$Path,[string]$Directory) {
+    Assert-ImagePolicy $Kind
+    $asset=New-PersonalizationImage $Path $Directory
+    if ($Kind -eq 'Wallpaper') {
+        # Loads the existing native desktop refresh helper without modifying wallpaper.
+        Send-DesktopPreferenceRefresh 'CustomWallpaper'
+        Set-DesktopPreferenceValue 'HKCU:' ([pscustomobject]@{Path='Control Panel\Desktop';Name='Wallpaper';Value=$asset;Type='String'})
+        Set-DesktopPreferenceValue 'HKCU:' ([pscustomobject]@{Path='Control Panel\Desktop';Name='WallpaperStyle';Value='10';Type='String'})
+        Set-DesktopPreferenceValue 'HKCU:' ([pscustomobject]@{Path='Control Panel\Desktop';Name='TileWallpaper';Value='0';Type='String'})
+        Set-VerifiedDword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers' 'BackgroundType' 0
+        if (![TinnosDesktopNative]::SystemParametersInfo(20,0,$asset,3)) {throw (New-TinnosError 'TNO-503' 'Windows rejected the wallpaper image.')}
+    } else {Set-LockScreenImage $asset}
+    if (!(Test-SelectedImage $Kind $asset)) {throw (New-TinnosError 'TNO-503' "$Kind API completed but the selected image could not be independently verified. Check policy/Spotlight settings and retry.")}
+    return [pscustomobject]@{Status='Configured';Artifact=$asset;Scope='Current account';Kind=$Kind}
+}
+
+function Assert-StartMenuSupport {
+    $version=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+    $build=[int]$version.CurrentBuildNumber
+    if ($version.EditionID -notmatch '^(Professional|Enterprise|Education|IoTEnterprise)' -or $build -lt 26100 -or ($build -eq 26100 -and [int]$version.UBR -lt 4770)) {
+        throw (New-TinnosError 'TNO-503' 'Empty Start requires updated Windows 11 Pro/Enterprise/Education 24H2 (KB5062660) or newer. Start layout changes are not applied on unsupported systems.')
+    }
 }
 
 Export-ModuleMember -Function *

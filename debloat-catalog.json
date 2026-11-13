@@ -57,5 +57,15 @@
   {"Id":"OneDrive","Name":"Uninstall Microsoft OneDrive (keep synced files)","Packages":[],"Services":[],"DesktopProducts":["Microsoft OneDrive"],"Vendor":"Microsoft"},
   {"Id":"McAfeeWebAdvisor","Name":"Uninstall WebAdvisor by McAfee (vendor prompt may appear)","Packages":[],"Services":[],"DesktopProducts":["WebAdvisor by McAfee","McAfee WebAdvisor","WebAdvisor da McAfee"],"Vendor":"McAfee","AllowInteractive":true},
   {"Id":"AccentGold","Name":"Set Windows accent to Yellow gold / Ouro Amarelo (#FFB900)","Packages":[],"Services":[],"Setting":"AccentGold"},
-  {"Id":"BackgroundMoss","Name":"Set desktop background to Moss / Musgo (#486860)","Packages":[],"Services":[],"Setting":"BackgroundMoss"}
+  {"Id":"BackgroundMoss","Name":"Set desktop background to Moss / Musgo (#486860)","Packages":[],"Services":[],"Setting":"BackgroundMoss"},
+  {"Id":"ASUSSystemDiagnosis","Name":"Deactivate ASUS System Diagnosis","Packages":[],"Services":["ASUSSystemDiagnosis"],"DefaultSelected":false,"Vendor":"ASUS","SelectWithVendor":false},
+  {"Id":"ASUSSystemAnalysis","Name":"Deactivate ASUS System Analysis","Packages":[],"Services":["ASUSSystemAnalysis"],"DefaultSelected":false,"Vendor":"ASUS","SelectWithVendor":false},
+  {"Id":"ASUSSwitchService","Name":"Deactivate ASUS Switch","Packages":[],"Services":["ASUSSwitch"],"DefaultSelected":false,"Vendor":"ASUS","SelectWithVendor":false},
+  {"Id":"ASUSSoftwareManagerService","Name":"Deactivate ASUS Software Manager","Packages":[],"Services":["ASUSSoftwareManager"],"DefaultSelected":false,"Vendor":"ASUS","SelectWithVendor":false},
+  {"Id":"ASUSOptimizationService","Name":"Deactivate ASUS Optimization (may affect hotkeys / battery settings)","Packages":[],"Services":["ASUSOptimization"],"DefaultSelected":false,"Vendor":"ASUS","SelectWithVendor":false},
+  {"Id":"ASUSAppService","Name":"Deactivate ASUS App Service (may affect MyASUS)","Packages":[],"Services":["ASUSAppService"],"DefaultSelected":false,"Vendor":"ASUS","SelectWithVendor":false},
+  {"Id":"AMDExternalEvents","Name":"Deactivate AMD External Events Utility (may affect display hotkeys / profiles)","Packages":[],"Services":["AMD External Events Utility"],"DefaultSelected":false},
+  {"Id":"AMDCrashDefender","Name":"Deactivate AMD Crash Defender Service (disables GPU crash recovery helper)","Packages":[],"Services":["AMD Crash Defender Service"],"DefaultSelected":false},
+  {"Id":"CryptographicServices","Name":"Deactivate Cryptographic Services / Servicos de Criptografia (affects Windows Update / signature verification)","Packages":[],"Services":["CryptSvc"],"DefaultSelected":false},
+  {"Id":"EmptyStartMenu","Name":"Hide Start menu content (clear pins, Recommended and All apps; restart)","Packages":[],"Services":[],"Setting":"EmptyStartMenu","DefaultSelected":false}
 ]
